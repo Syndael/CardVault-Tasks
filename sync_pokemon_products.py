@@ -262,7 +262,8 @@ def sync():
         print(f" {en_name:<28}", end="", flush=True)
 
         translations = {}
-        for tcgdex_code, lang_id in lang_by_abr.items():
+        for tcgdex_code in image_tcgdex_codes:
+            lang_id = lang_by_abr[tcgdex_code]
             if tcgdex_code == "en":
                 translations["en"] = {"name": en_name, "lang_id": lang_id}
                 continue
