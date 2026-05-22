@@ -22,7 +22,7 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 PARAM_KEY_API_BASE = "sync.pokemon.products.api.base"
 PARAM_KEY_CAR_TYPE = "sync.pokemon.products.card.type"
 PARAM_KEY_MIG_LANG = "sync.pokemon.products.migration.languages"
-PARAM_KEY_FILES_PATH = "sync.pokemon.products.files.path"
+PARAM_KEY_FILES_PATH = "sync.pokemon.products.img.path"
 PARAM_KEY_IMG_PATH_PATTERN = "sync.pokemon.products.img.path.pattern"
 SEP = "=" * 58
 
