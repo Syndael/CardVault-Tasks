@@ -13,6 +13,7 @@ load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+_API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -21,6 +22,8 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 PARAM_KEY_API_BASE = "sync.pokemon.products.api.base"
 PARAM_KEY_CAR_TYPE = "sync.pokemon.products.card.type"
 PARAM_KEY_MIG_LANG = "sync.pokemon.products.migration.languages"
+PARAM_KEY_FILES_PATH = "sync.pokemon.products.files.path"
+PARAM_KEY_IMG_PATH_PATTERN = "sync.pokemon.products.img.path.pattern"
 SEP = "=" * 58
 
 _token: str | None = None
@@ -184,6 +187,15 @@ def url_exists(url):
         return False
 
 
+def download_file(url):
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
 def sync():
     print(f"\n{SEP}")
     print(f"  Searching Pokémon cards via CardVault API")
@@ -196,6 +208,8 @@ def sync():
     api_base = get_param(settings_by_key, PARAM_KEY_API_BASE)
     card_type = get_param(settings_by_key, PARAM_KEY_CAR_TYPE)
     migration_languages = get_param(settings_by_key, PARAM_KEY_MIG_LANG)
+    files_path = get_param(settings_by_key, PARAM_KEY_FILES_PATH)
+    img_path_pattern = get_param(settings_by_key, PARAM_KEY_IMG_PATH_PATTERN)
     print(f"  Languages img: {migration_languages}")
     print(SEP)
 
@@ -303,6 +317,23 @@ def sync():
                     original_name = f"{tcgdex_id}_{tcgdex_code}.jpg"
                     stored_name = f"{set_code}_{product_number}_{tcgdex_code}.jpg"
 
+                    image_data = download_file(image_url)
+                    if image_data is None:
+                        img_results.append(f"{tcgdex_code}=✗")
+                        stats["img_fail"] += 1
+                        continue
+
+                    sub_dir = img_path_pattern.replace("{card_type}", card_type).replace("{collection_code}", set_code)
+                    base_dir = files_path if os.path.isabs(files_path) else os.path.join(_API_ROOT, files_path)
+                    target_dir = os.path.join(base_dir, sub_dir)
+                    os.makedirs(target_dir, exist_ok=True)
+
+                    local_rel = os.path.join(files_path, sub_dir, stored_name)
+                    local_abs = os.path.join(base_dir, sub_dir, stored_name)
+                    with open(local_abs, "wb") as f:
+                        f.write(image_data)
+                    file_size = len(image_data)
+
                     try:
                         result = api_request("POST", "files", {
                             "product_id": product_id,
@@ -310,8 +341,8 @@ def sync():
                             "file_type_id": image_file_type_id,
                             "original_name": original_name,
                             "stored_name": stored_name,
-                            "file_path": image_url,
-                            "file_size": 0
+                            "file_path": local_rel,
+                            "file_size": file_size
                         })
                         if result:
                             img_results.append(f"{tcgdex_code}=✓")
