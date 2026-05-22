@@ -1,8 +1,5 @@
-INSERT INTO settings (setting_key, setting_value) VALUES
-('sync.pokemon.collections.api.base', 'https://api.tcgdex.net/v2'),
-('sync.pokemon.collections.card.type', 'POK'),
-('sync.pokemon.collections.migration.languages', 'en-EN;es-ES;ja-JP;de-DE;ko-KR;fr-FR;it-IT;pt-PT;'),
-('sync.pokemon.products.api.base', 'https://api.tcgdex.net/v2'),
-('sync.pokemon.products.card.type', 'POK'),
-('sync.pokemon.products.migration.languages', 'en;es;ja;ko;de;'),
-('sync.pokemon.products.img.path', './../.files/products_images');
+INSERT INTO scheduled_tasks (name, script_path, cron_expression, enabled)
+VALUES
+  ('Sincronizar colecciones Pokemon', 'sync_pokemon_collections.py', '0 9 * * 1', 1),
+  ('Sincronizar productos Pokemon',  'sync_pokemon_products.py',   '0 15 * * *', 1),
+  ('Marcar descarga forzada',        'mark_force_download.py',     NULL,         1);

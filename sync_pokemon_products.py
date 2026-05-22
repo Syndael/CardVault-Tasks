@@ -251,7 +251,12 @@ def sync():
 
         print(f"  [{i + 1:>4}/{len(pending)}] {tcgdex_id:<22}", end="", flush=True)
 
-        en_data = fetch_json(f"{api_base}/en/cards/{tcgdex_id}")
+        try:
+            en_data = fetch_json(f"{api_base}/en/cards/{tcgdex_id}")
+        except Exception as e:
+            print(f"  error: {e}")
+            stats["not_found"] += 1
+            continue
         if not en_data or not en_data.get("name"):
             print("  not found")
             stats["not_found"] += 1
@@ -261,83 +266,92 @@ def sync():
         image_base = en_data.get("image", "")
         print(f" {en_name:<28}", end="", flush=True)
 
-        translations = {}
-        for tcgdex_code in image_tcgdex_codes:
-            lang_id = lang_by_abr[tcgdex_code]
-            if tcgdex_code == "en":
-                translations["en"] = {"name": en_name, "lang_id": lang_id}
-                continue
-            t = fetch_json(f"{api_base}/{tcgdex_code}/cards/{tcgdex_id}")
-            if t and t.get("name"):
-                translations[tcgdex_code] = {"name": t["name"], "lang_id": lang_id}
-            time.sleep(0.05)
-
-        print(f" trans:[{','.join(translations.keys())}]", end="", flush=True)
-
-        img_results = []
-        existing_img_lang_ids = img_by_product.get(product_id, set())
-
-        if image_base:
+        try:
+            translations = {}
             for tcgdex_code in image_tcgdex_codes:
-                lang_id = lang_by_abr.get(tcgdex_code)
-                if lang_id and lang_id in existing_img_lang_ids:
-                    img_results.append(f"{tcgdex_code}=skip")
-                    stats["img_skip"] += 1
+                lang_id = lang_by_abr[tcgdex_code]
+                if tcgdex_code == "en":
+                    translations["en"] = {"name": en_name, "lang_id": lang_id}
                     continue
-
-                image_url = get_tcgdex_image_url(image_base, tcgdex_code)
-                if not url_exists(image_url):
-                    img_results.append(f"{tcgdex_code}=—")
-                    continue
-
-                original_name = f"{tcgdex_id}_{tcgdex_code}.jpg"
-                stored_name = f"{set_code}_{product_number}_{tcgdex_code}.jpg"
-
                 try:
-                    result = api_request("POST", "files", {
-                        "product_id": product_id,
-                        "language_id": lang_id,
-                        "file_type_id": image_file_type_id,
-                        "original_name": original_name,
-                        "stored_name": stored_name,
-                        "file_path": image_url,
-                        "file_size": 0
-                    })
-                    if result:
-                        img_results.append(f"{tcgdex_code}=✓")
-                        stats["img_ok"] += 1
-                    else:
+                    t = fetch_json(f"{api_base}/{tcgdex_code}/cards/{tcgdex_id}")
+                except Exception as e:
+                    print(f"  trans '{tcgdex_code}' error: {e}")
+                    continue
+                if t and t.get("name"):
+                    translations[tcgdex_code] = {"name": t["name"], "lang_id": lang_id}
+                time.sleep(0.05)
+
+            print(f" trans:[{','.join(translations.keys())}]", end="", flush=True)
+
+            img_results = []
+            existing_img_lang_ids = img_by_product.get(product_id, set())
+
+            if image_base:
+                for tcgdex_code in image_tcgdex_codes:
+                    lang_id = lang_by_abr.get(tcgdex_code)
+                    if lang_id and lang_id in existing_img_lang_ids:
+                        img_results.append(f"{tcgdex_code}=skip")
+                        stats["img_skip"] += 1
+                        continue
+
+                    image_url = get_tcgdex_image_url(image_base, tcgdex_code)
+                    if not url_exists(image_url):
+                        img_results.append(f"{tcgdex_code}=—")
+                        continue
+
+                    original_name = f"{tcgdex_id}_{tcgdex_code}.jpg"
+                    stored_name = f"{set_code}_{product_number}_{tcgdex_code}.jpg"
+
+                    try:
+                        result = api_request("POST", "files", {
+                            "product_id": product_id,
+                            "language_id": lang_id,
+                            "file_type_id": image_file_type_id,
+                            "original_name": original_name,
+                            "stored_name": stored_name,
+                            "file_path": image_url,
+                            "file_size": 0
+                        })
+                        if result:
+                            img_results.append(f"{tcgdex_code}=✓")
+                            stats["img_ok"] += 1
+                        else:
+                            img_results.append(f"{tcgdex_code}=✗")
+                            stats["img_fail"] += 1
+                    except urllib.error.HTTPError:
                         img_results.append(f"{tcgdex_code}=✗")
                         stats["img_fail"] += 1
-                except urllib.error.HTTPError:
-                    img_results.append(f"{tcgdex_code}=✗")
-                    stats["img_fail"] += 1
 
-        print(f" img:[{','.join(img_results) or '—'}]")
+            print(f" img:[{','.join(img_results) or '—'}]")
 
-        for tcgdex_code, t in translations.items():
-            existing = api_get("product-translations", {
-                "product_id": product_id,
-                "language_id": t["lang_id"],
-                "per_page": 1
-            })
-            existing_items = (existing or {}).get("items", [])
-            if existing_items:
-                api_request("PATCH", f"product-translations/{existing_items[0]['id']}", {
-                    "name": t["name"]
-                })
-            else:
-                api_request("POST", "product-translations", {
+            for tcgdex_code, t in translations.items():
+                existing = api_get("product-translations", {
                     "product_id": product_id,
                     "language_id": t["lang_id"],
-                    "name": t["name"]
+                    "per_page": 1
                 })
-            stats["trans"] += 1
+                existing_items = (existing or {}).get("items", [])
+                if existing_items:
+                    api_request("PATCH", f"product-translations/{existing_items[0]['id']}", {
+                        "name": t["name"]
+                    })
+                else:
+                    api_request("POST", "product-translations", {
+                        "product_id": product_id,
+                        "language_id": t["lang_id"],
+                        "name": t["name"]
+                    })
+                stats["trans"] += 1
 
-        # force_download = 0
-        api_request("PATCH", f"products/{product_id}", {"force_download": False})
+            # force_download = 0, is_manual = 0
+            api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
 
-        stats["cards_ok"] += 1
+            stats["cards_ok"] += 1
+        except Exception as e:
+            print(f"  error processing product: {e}")
+            stats["not_found"] += 1
+
         time.sleep(0.1)
 
     print(f"\n{SEP}")

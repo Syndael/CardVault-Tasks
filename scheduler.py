@@ -145,6 +145,10 @@ def update_execution(execution_id, status, started_at=None, finished_at=None, ou
 def process_task(task, now):
     task_id = task["id"]
     task_name = task["name"]
+    cron_expr = task.get("cron_expression")
+
+    if not cron_expr:
+        return
 
     last = get_last_execution(task_id)
     if last:
@@ -152,7 +156,7 @@ def process_task(task, now):
     else:
         base = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    cron = croniter(task["cron_expression"], base)
+    cron = croniter(cron_expr, base)
     created = 0
     while True:
         next_run = cron.get_next(datetime)
