@@ -152,7 +152,7 @@ def process_task(task, now):
 
     last = get_last_execution(task_id)
     if last:
-        base = datetime.fromisoformat(last["scheduled_date"]).replace(tzinfo=timezone.utc)
+        base = datetime.fromisoformat(last["scheduled_date"]).replace(tzinfo=None)
     else:
         base = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -185,11 +185,11 @@ def run_execution(execution):
 
     if not script_path:
         log.error("No script_path for execution %d", exec_id)
-        update_execution(exec_id, "error", started_at=dt_to_str(datetime.now(timezone.utc)),
-                         finished_at=dt_to_str(datetime.now(timezone.utc)), output="No script_path configured")
+        update_execution(exec_id, "error", started_at=dt_to_str(datetime.now()),
+                         finished_at=dt_to_str(datetime.now()), output="No script_path configured")
         return
 
-    update_execution(exec_id, "running", started_at=dt_to_str(datetime.now(timezone.utc)))
+    update_execution(exec_id, "running", started_at=dt_to_str(datetime.now()))
 
     try:
         if not os.path.isabs(script_path):
@@ -211,13 +211,13 @@ def run_execution(execution):
             status = "error"
             log.warning("'%s' failed (exit %d)", task_name, result.returncode)
 
-        update_execution(exec_id, status, finished_at=dt_to_str(datetime.now(timezone.utc)), output=output)
+        update_execution(exec_id, status, finished_at=dt_to_str(datetime.now()), output=output)
     except subprocess.TimeoutExpired:
-        update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now(timezone.utc)),
+        update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()),
                          output="Timeout after 3600s")
         log.error("'%s' timed out", task_name)
     except Exception as e:
-        update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now(timezone.utc)), output=str(e))
+        update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=str(e))
         log.exception("'%s' raised exception", task_name)
 
 
@@ -225,7 +225,7 @@ def main_loop(interval):
     log.info("Scheduler started (poll every %ds)", interval)
     while True:
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now()
 
             tasks = get_enabled_tasks()
             for task in tasks:
