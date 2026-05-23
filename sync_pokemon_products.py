@@ -323,7 +323,8 @@ def sync():
                         stats["img_fail"] += 1
                         continue
 
-                    sub_dir = img_path_pattern.replace("{card_type}", card_type).replace("{collection_code}", set_code)
+                    is_manual_val = "1" if product.get("product_is_manual") else "0"
+                    sub_dir = img_path_pattern.replace("{card_type}", card_type).replace("{is_manual}", is_manual_val).replace("{collection_code}", set_code)
                     base_dir = files_path if os.path.isabs(files_path) else os.path.join(_API_ROOT, files_path)
                     target_dir = os.path.join(base_dir, sub_dir)
                     os.makedirs(target_dir, exist_ok=True)
