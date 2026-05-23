@@ -224,7 +224,8 @@ def create_collection(card_type_id, set_id, release_date):
         {
             "card_type_id": card_type_id,
             "code": set_id,
-            "release_date": release_date or None
+            "release_date": release_date or None,
+            "is_manual": False
         }
     )
 
