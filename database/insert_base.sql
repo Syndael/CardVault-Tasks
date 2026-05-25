@@ -8,4 +8,4 @@ INSERT INTO settings(setting_key, setting_value) VALUES ('sync.name.alter.lang.t
 INSERT INTO settings(setting_key, setting_value) VALUES ('sync.name.alter.lang.sources', 'ES,EN');
 
 INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
-VALUES ('sync_name_alter', 'sync_name_alter.py', '0 16 * * *', 1);
+VALUES ('Sincronizar nombres alternativos', 'sync_name_alter.py', '0 16 * * *', 1);
