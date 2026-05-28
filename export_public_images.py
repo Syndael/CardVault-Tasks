@@ -82,7 +82,7 @@ def api_request(method, path, data=None):
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=35) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
@@ -186,7 +186,7 @@ def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None):
                 images.append(f)
         if sort_map:
             def sort_key(fname):
-                inv_id = fname.split("-", 1)[0]
+                inv_id = fname.split('-')[0].rsplit('__', 1)[-1]
                 key = sort_map.get(inv_id)
                 if key:
                     return key + (inv_id,)
@@ -273,20 +273,24 @@ def main():
         coll_code = collection.get("code") or ""
         prod_number = product.get("product_number") or ""
         prod_num_padded = natural_pad(prod_number)
-        prod_name = product.get("name") or ""
+        translations = product.get("translations") or []
+        prod_name = (translations[0] or {}).get("name", "") if translations else ""
         sort_map[str(inv_id)] = (coll_code, prod_num_padded, prod_name)
         language = item.get("language") or {}
         lang_map[str(inv_id)] = (language.get("abbreviation") or "")[:3]
         condition = item.get("condition") or {}
         cond_map[str(inv_id)] = (condition.get("abbreviation") or "")[:5]
 
-    print("  Cleaning old-style duplicates...")
+    print("  Cleaning old-style duplicates and empty directories...")
     root = os.path.abspath(public_path)
     for dirpath, dirnames, filenames in os.walk(root):
         for f in filenames:
             if f.startswith("__") and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
                 fp = os.path.join(dirpath, f)
                 os.remove(fp)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if not os.listdir(dirpath):
+            os.rmdir(dirpath)
 
     copied = 0
     skipped = 0
@@ -315,7 +319,8 @@ def main():
         collection = item.get("collection") or {}
         coll_code = collection.get("code") or ""
         prod_number = product.get("product_number") or ""
-        prod_name = product.get("name") or ""
+        translations = product.get("translations") or []
+        prod_name = (translations[0] or {}).get("name", "") if translations else ""
         sort_prefix = build_sort_prefix(coll_code, prod_number, prod_name)
 
         for category, section_name in active_categories.items():
@@ -333,6 +338,13 @@ def main():
                         os.rmdir(old_dir)
                     except OSError:
                         pass
+                    parent = os.path.dirname(old_dir)
+                    while parent != public_path and os.path.isdir(parent):
+                        try:
+                            os.rmdir(parent)
+                        except OSError:
+                            break
+                        parent = os.path.dirname(parent)
 
             for f in inv_files:
                 file_id = f["id"]
