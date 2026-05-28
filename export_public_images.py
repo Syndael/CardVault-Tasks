@@ -155,7 +155,7 @@ def resolve_url(relative_url):
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
-def generate_data_js(public_path):
+def generate_data_js(public_path, sort_map=None):
     data = {}
     root = os.path.abspath(public_path)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -163,12 +163,22 @@ def generate_data_js(public_path):
         if rel == ".":
             continue
         images = []
-        for f in sorted(filenames):
+        for f in filenames:
             if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
-                images.append(os.path.join(rel, f).replace("\\", "/"))
+                images.append(f)
+        if sort_map:
+            def sort_key(fname):
+                inv_id = fname.split("-", 1)[0]
+                key = sort_map.get(inv_id)
+                if key:
+                    return key + (inv_id,)
+                return ("", "", "", "", fname)
+            images.sort(key=sort_key)
+        else:
+            images.sort()
         data[rel] = {
             "directories": sorted(dirnames),
-            "images": images
+            "images": [os.path.join(rel, f).replace("\\", "/") for f in images]
         }
     js_path = os.path.join(root, "data.js")
     with open(js_path, "w", encoding="utf-8") as fh:
@@ -231,6 +241,19 @@ def main():
 
     print(f"  Total unique inventory items to process: {len(seen_items)}")
     print()
+
+    sort_map = {}
+    for inv_id, item in seen_items.items():
+        product = item.get("product") or {}
+        collection = product.get("collection") or {}
+        coll_code = collection.get("code") or ""
+        prod_number = product.get("product_number") or ""
+        try:
+            prod_num_padded = f"{int(prod_number):06d}"
+        except (ValueError, TypeError):
+            prod_num_padded = prod_number.lower()
+        prod_name = product.get("name") or ""
+        sort_map[str(inv_id)] = (coll_code, prod_num_padded, prod_name)
 
     copied = 0
     skipped = 0
@@ -320,7 +343,7 @@ def main():
                         errors += 1
 
     print("  Generating data.js...")
-    generate_data_js(public_path)
+    generate_data_js(public_path, sort_map=sort_map)
     print("  data.js updated\n")
 
     print(f"\n  {SEP}")
