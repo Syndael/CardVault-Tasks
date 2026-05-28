@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Export inventory images to public web directory.
-
-Setting key: web.public.path
-
-For each inventory record whose tags contain "album", "caja" or "vitrina",
-copies all inventory images and the best product image to:
-
-{web.public.path}/{category}/{card_type}/{tag_name}/
-  {inventory_id}-{file_id}.{ext}   (inventory images)
-  {inventory_id}-prod.{ext}        (product image)
-"""
-
 import json
 import os
 import re
@@ -25,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SETTING_KEY_PUBLIC_PATH = "web.public.path"
+SETTING_KEY_PUBLIC_PATH = "export.public.images.path"
 TAG_CATEGORIES = ["album", "caja", "vitrina"]
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
