@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import sys
 import urllib.error
 import urllib.parse
@@ -152,6 +153,23 @@ def resolve_url(relative_url):
     return f"{base}{relative_url}"
 
 
+def natural_pad(s, width=6):
+    parts = re.split(r'(\d+)', s)
+    for i, part in enumerate(parts):
+        if part.isdigit():
+            parts[i] = f"{int(part):0{width}d}"
+    return ''.join(parts)
+
+def safe_name(s, max_len=50):
+    return re.sub(r'[^a-zA-Z0-9]', '_', s)[:max_len].strip('_')
+
+def build_sort_prefix(coll_code, prod_number, prod_name):
+    return f"{coll_code}__{natural_pad(prod_number)}__{safe_name(prod_name)}__"
+
+def old_card_type(item):
+    pt = (item.get("product") or {}).get("product_type") or {}
+    return pt.get("name") or "unknown"
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
@@ -251,19 +269,24 @@ def main():
     cond_map = {}
     for inv_id, item in seen_items.items():
         product = item.get("product") or {}
-        collection = product.get("collection") or {}
+        collection = item.get("collection") or {}
         coll_code = collection.get("code") or ""
         prod_number = product.get("product_number") or ""
-        try:
-            prod_num_padded = f"{int(prod_number):06d}"
-        except (ValueError, TypeError):
-            prod_num_padded = prod_number.lower()
+        prod_num_padded = natural_pad(prod_number)
         prod_name = product.get("name") or ""
         sort_map[str(inv_id)] = (coll_code, prod_num_padded, prod_name)
         language = item.get("language") or {}
         lang_map[str(inv_id)] = (language.get("abbreviation") or "")[:3]
         condition = item.get("condition") or {}
         cond_map[str(inv_id)] = (condition.get("abbreviation") or "")[:5]
+
+    print("  Cleaning old-style duplicates...")
+    root = os.path.abspath(public_path)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if f.startswith("__") and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
+                fp = os.path.join(dirpath, f)
+                os.remove(fp)
 
     copied = 0
     skipped = 0
@@ -289,17 +312,41 @@ def main():
         inv_files_raw = api_get(f"files/by-inventory/{inv_id}")
         inv_files = inv_files_raw if isinstance(inv_files_raw, list) else []
 
+        collection = item.get("collection") or {}
+        coll_code = collection.get("code") or ""
+        prod_number = product.get("product_number") or ""
+        prod_name = product.get("name") or ""
+        sort_prefix = build_sort_prefix(coll_code, prod_number, prod_name)
+
         for category, section_name in active_categories.items():
             target_dir = os.path.join(public_path, category, card_type, section_name)
             os.makedirs(target_dir, exist_ok=True)
 
+            old_type_name = product_type.get("name") or "unknown"
+            if old_type_name != card_type:
+                old_dir = os.path.join(public_path, category, old_type_name, section_name)
+                if os.path.isdir(old_dir):
+                    print(f"    Migrating {old_dir} → {target_dir}")
+                    for fname in os.listdir(old_dir):
+                        shutil.move(os.path.join(old_dir, fname), os.path.join(target_dir, fname))
+                    try:
+                        os.rmdir(old_dir)
+                    except OSError:
+                        pass
+
             for f in inv_files:
                 file_id = f["id"]
                 ext = get_extension(f.get("original_name", ""), f.get("file_path", ""))
-                dest_name = f"{inv_id}-{file_id}{ext}"
+                dest_name = f"{sort_prefix}{inv_id}-{file_id}{ext}"
                 dest_path = os.path.join(target_dir, dest_name)
 
+                old_name = f"{inv_id}-{file_id}{ext}"
+                old_path = os.path.join(target_dir, old_name)
                 if os.path.exists(dest_path):
+                    skipped += 1
+                    continue
+                if os.path.exists(old_path):
+                    os.rename(old_path, dest_path)
                     skipped += 1
                     continue
 
@@ -319,38 +366,44 @@ def main():
                 copied += 1
                 print(f"    [{category}/{section_name}] inv#{inv_id} file#{file_id} -> {dest_path}")
 
-            product_image_url = item.get("product_image_url")
-            if product_image_url:
-                m = re.search(r'/files/(\d+)/content', product_image_url)
-                prod_file_id = int(m.group(1)) if m else None
+        product_image_url = item.get("product_image_url")
+        if product_image_url:
+            m = re.search(r'/files/(\d+)/content', product_image_url)
+            prod_file_id = int(m.group(1)) if m else None
 
-                if prod_file_id:
-                    prod_meta = api_get(f"files/{prod_file_id}")
-                    prod_ext = get_extension(
-                        (prod_meta or {}).get("original_name", ""),
-                        (prod_meta or {}).get("file_path", "")
-                    )
+            if prod_file_id:
+                prod_meta = api_get(f"files/{prod_file_id}")
+                prod_ext = get_extension(
+                    (prod_meta or {}).get("original_name", ""),
+                    (prod_meta or {}).get("file_path", "")
+                )
+            else:
+                prod_ext = ".jpg"
+
+            dest_name = f"{sort_prefix}{inv_id}-prod{prod_ext}"
+            dest_path = os.path.join(target_dir, dest_name)
+
+            old_name = f"{inv_id}-prod{prod_ext}"
+            old_path = os.path.join(target_dir, old_name)
+            if os.path.exists(dest_path):
+                skipped += 1
+                continue
+            if os.path.exists(old_path):
+                os.rename(old_path, dest_path)
+                skipped += 1
+                continue
+
+            full_url = resolve_url(product_image_url)
+            if full_url:
+                data = download_file(full_url)
+                if data is not None:
+                    with open(dest_path, "wb") as fh:
+                        fh.write(data)
+                    copied += 1
+                    print(f"    [{category}/{section_name}] inv#{inv_id} prod -> {dest_path}")
                 else:
-                    prod_ext = ".jpg"
-
-                dest_name = f"{inv_id}-prod{prod_ext}"
-                dest_path = os.path.join(target_dir, dest_name)
-
-                if os.path.exists(dest_path):
-                    skipped += 1
-                    continue
-
-                full_url = resolve_url(product_image_url)
-                if full_url:
-                    data = download_file(full_url)
-                    if data is not None:
-                        with open(dest_path, "wb") as fh:
-                            fh.write(data)
-                        copied += 1
-                        print(f"    [{category}/{section_name}] inv#{inv_id} prod -> {dest_path}")
-                    else:
-                        print(f"    ERROR downloading product image for inv#{inv_id}")
-                        errors += 1
+                    print(f"    ERROR downloading product image for inv#{inv_id}")
+                    errors += 1
 
     print("  Generating data.js...")
     generate_data_js(public_path, sort_map=sort_map, lang_map=lang_map, cond_map=cond_map)
