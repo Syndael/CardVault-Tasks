@@ -312,11 +312,7 @@ def main():
         inv_files_raw = api_get(f"files/by-inventory/{inv_id}")
         inv_files = inv_files_raw if isinstance(inv_files_raw, list) else []
 
-<<<<<<< HEAD
         collection = item.get("collection") or {}
-=======
-        collection = product.get("collection") or {}
->>>>>>> origin/main
         coll_code = collection.get("code") or ""
         prod_number = product.get("product_number") or ""
         prod_name = product.get("name") or ""
