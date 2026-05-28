@@ -155,7 +155,7 @@ def resolve_url(relative_url):
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
-def generate_data_js(public_path, sort_map=None):
+def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None):
     data = {}
     root = os.path.abspath(public_path)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -180,6 +180,10 @@ def generate_data_js(public_path, sort_map=None):
             "directories": sorted(dirnames),
             "images": [os.path.join(rel, f).replace("\\", "/") for f in images]
         }
+    if lang_map:
+        data["_langMap"] = lang_map
+    if cond_map:
+        data["_condMap"] = cond_map
     js_path = os.path.join(root, "data.js")
     with open(js_path, "w", encoding="utf-8") as fh:
         fh.write("const DIR_DATA = ")
@@ -243,6 +247,8 @@ def main():
     print()
 
     sort_map = {}
+    lang_map = {}
+    cond_map = {}
     for inv_id, item in seen_items.items():
         product = item.get("product") or {}
         collection = product.get("collection") or {}
@@ -254,6 +260,10 @@ def main():
             prod_num_padded = prod_number.lower()
         prod_name = product.get("name") or ""
         sort_map[str(inv_id)] = (coll_code, prod_num_padded, prod_name)
+        language = item.get("language") or {}
+        lang_map[str(inv_id)] = (language.get("abbreviation") or "")[:3]
+        condition = item.get("condition") or {}
+        cond_map[str(inv_id)] = (condition.get("abbreviation") or "")[:5]
 
     copied = 0
     skipped = 0
@@ -343,7 +353,7 @@ def main():
                         errors += 1
 
     print("  Generating data.js...")
-    generate_data_js(public_path, sort_map=sort_map)
+    generate_data_js(public_path, sort_map=sort_map, lang_map=lang_map, cond_map=cond_map)
     print("  data.js updated\n")
 
     print(f"\n  {SEP}")
