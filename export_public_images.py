@@ -82,7 +82,7 @@ def api_request(method, path, data=None):
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
 
     try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
@@ -164,7 +164,7 @@ def safe_name(s, max_len=50):
     return re.sub(r'[^a-zA-Z0-9]', '_', s)[:max_len].strip('_')
 
 def build_sort_prefix(coll_code, prod_number, prod_name):
-    return f"{coll_code}__{natural_pad(prod_number)}__{safe_name(prod_name)}__"
+    return f"{coll_code.replace('-', '_')}__{natural_pad(prod_number)}__{safe_name(prod_name)}__"
 
 def old_card_type(item):
     pt = (item.get("product") or {}).get("product_type") or {}
