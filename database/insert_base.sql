@@ -4,6 +4,15 @@ VALUES
   ('Sincronizar productos Pokemon',  'sync_pokemon_products.py',   '0 15 * * *', 1),
   ('Marcar descarga forzada',        'mark_force_download.py',     NULL,         1);
 
+INSERT INTO scheduled_tasks (name, script_path, cron_expression, enabled)
+VALUES
+  ('Sincronizar colecciones Magic',    'sync_magic_collections.py',    '15 9 * * 1', 1),
+  ('Sincronizar colecciones Digimon',  'sync_digimon_collections.py',  '30 9 * * 1', 1),
+  ('Sincronizar colecciones Yu-Gi-Oh', 'sync_yugioh_collections.py',   '45 9 * * 1', 1),
+  ('Sincronizar productos Magic',      'sync_magic_products.py',       '15 15 * * *', 1),
+  ('Sincronizar productos Digimon',    'sync_digimon_products.py',     '30 15 * * *', 1),
+  ('Sincronizar productos Yu-Gi-Oh',   'sync_yugioh_products.py',      '45 15 * * *', 1);
+
 INSERT INTO settings(setting_key, setting_value) VALUES ('sync.name.alter.lang.targets', 'JP,KR,CHT,CHS');
 INSERT INTO settings(setting_key, setting_value) VALUES ('sync.name.alter.lang.sources', 'ES,EN');
 
@@ -15,3 +24,29 @@ INSERT INTO settings(setting_key, setting_value) VALUES ('export.public.images.p
 
 INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
 VALUES ('Exportación de imágenes para web pública', 'export_public_images.py', '0 10 * * *', 1);
+
+INSERT INTO settings (setting_key, setting_value) VALUES
+('sync.magic.collections.api.base', 'https://api.scryfall.com'),
+('sync.magic.collections.card.type', 'MTG'),
+('sync.magic.collections.migration.languages', 'en-EN;es-ES;'),
+('sync.magic.products.api.base', 'https://api.scryfall.com'),
+('sync.magic.products.card.type', 'MTG'),
+('sync.magic.products.migration.languages', 'en;es;'),
+('sync.magic.products.img.path', './../.files/products_images'),
+('sync.magic.products.img.path.pattern', '{card_type}/{collection_code}'),
+('sync.digimon.collections.api.base', 'https://www.digimoncard.io/api-public'),
+('sync.digimon.collections.card.type', 'DIG'),
+('sync.digimon.collections.migration.languages', 'en-EN;'),
+('sync.digimon.products.api.base', 'https://www.digimoncard.io/api-public'),
+('sync.digimon.products.card.type', 'DIG'),
+('sync.digimon.products.migration.languages', 'en;'),
+('sync.digimon.products.img.path', './../.files/products_images'),
+('sync.digimon.products.img.path.pattern', '{card_type}/{collection_code}'),
+('sync.yugioh.collections.api.base', 'https://db.ygoprodeck.com/api/v7'),
+('sync.yugioh.collections.card.type', 'YUG'),
+('sync.yugioh.collections.migration.languages', 'en-EN;es-ES;'),
+('sync.yugioh.products.api.base', 'https://db.ygoprodeck.com/api/v7'),
+('sync.yugioh.products.card.type', 'YUG'),
+('sync.yugioh.products.migration.languages', 'en;es;ja;'),
+('sync.yugioh.products.img.path', './../.files/products_images'),
+('sync.yugioh.products.img.path.pattern', '{card_type}/{collection_code}');
