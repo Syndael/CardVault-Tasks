@@ -100,7 +100,11 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        raise
+        print(f"\n  [API {e.code}] {method} {path}")
+        return None
+    except Exception as e:
+        print(f"\n  [API error] {method} {path}: {e}")
+        return None
 
 
 def api_get(path, params=None):
