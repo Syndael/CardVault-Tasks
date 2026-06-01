@@ -98,7 +98,11 @@ def api_request(method, path, data=None, timeout=15):
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        raise
+        log.error("HTTP %d on %s %s", e.code, method, path)
+        return None
+    except Exception as e:
+        log.error("Request error on %s %s: %s", method, path, e)
+        return None
 
 
 def api_get(path):
@@ -131,6 +135,9 @@ def get_pending_executions():
     return api_get("task-executions/pending") or []
 
 
+MAX_OUTPUT_LENGTH = 50000
+
+
 def update_execution(execution_id, status, started_at=None, finished_at=None, output=None):
     data = {"status": status}
     if started_at is not None:
@@ -138,6 +145,8 @@ def update_execution(execution_id, status, started_at=None, finished_at=None, ou
     if finished_at is not None:
         data["finished_at"] = finished_at
     if output is not None:
+        if len(output) > MAX_OUTPUT_LENGTH:
+            output = output[:MAX_OUTPUT_LENGTH] + "\n... (truncated)"
         data["output"] = output
     api_request("PATCH", f"task-executions/{execution_id}", data)
 
