@@ -75,7 +75,44 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise
+        return None
+    except Exception:
+        return None
+
+
+def api_request(method, path, data=None):
+    clean_path = path.strip("/")
+    if "?" in clean_path:
+        clean_path, query_string = clean_path.split("?", 1)
+        url = f"{API_BASE.rstrip('/')}/{clean_path}/?{query_string}"
+    else:
+        url = f"{API_BASE.rstrip('/')}/{clean_path}/"
+    body = None
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    token = _get_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            if _login():
+                token = _get_token()
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                req = urllib.request.Request(url, data=body, method=method, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return json.loads(raw) if raw else None
+        return None
+    except Exception:
+        return None
     except Exception:
         return None
 
@@ -115,7 +152,9 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        raise
+        return None
+    except Exception:
+        return None
 
 
 def api_get(path, params=None):

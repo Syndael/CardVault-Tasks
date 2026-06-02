@@ -64,7 +64,7 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise
+        return None
     except Exception:
         return None
 

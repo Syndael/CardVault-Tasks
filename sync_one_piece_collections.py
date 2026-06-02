@@ -58,7 +58,7 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise
+        return None
     except Exception:
         return None
 
@@ -98,7 +98,9 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        raise
+        return None
+    except Exception:
+        return None
 
 
 def api_get(path, params=None):

@@ -65,7 +65,7 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code in (400, 404):
             return None
-        raise
+        return None
     except Exception:
         return None
 

@@ -95,7 +95,9 @@ def api_request(method, path, data=None, timeout=15):
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
         print(f"  API error {e.code} on {method} {url}", file=sys.stderr)
-        raise
+        return None
+    except Exception:
+        return None
 
 
 def api_get(path):
