@@ -69,7 +69,7 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise
+        return None
     except Exception:
         return None
 
@@ -81,7 +81,7 @@ def _urlopen_with_retry(req, max_retries=3):
                 return resp.read()
         except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError):
             if attempt == max_retries - 1:
-                raise
+                return None
             delay = (attempt + 1) * 2
             print(f"\n  [!] Connection error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...", end="", flush=True)
             time.sleep(delay)
@@ -120,7 +120,9 @@ def api_request(method, path, data=None):
                 req = urllib.request.Request(url, data=body, method=method, headers=headers)
                 raw = _urlopen_with_retry(req)
                 return json.loads(raw.decode("utf-8")) if raw else None
-        raise
+        return None
+    except Exception:
+        return None
 
 
 def api_get(path, params=None):

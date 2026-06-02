@@ -68,7 +68,7 @@ def fetch_json(url):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
-        raise
+        return None
     except Exception:
         return None
 
@@ -120,7 +120,9 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        raise
+        return None
+    except Exception:
+        return None
 
 
 def api_get(path, params=None):
@@ -342,24 +344,25 @@ def sync():
             if not lang_id:
                 continue
 
+            existing_translation = None
             if lang == "en":
                 name = en_name
             else:
+                existing_translation = translations_by_collection_lang.get(
+                    (collection_id, lang_id)
+                )
+                if existing_translation and not is_new_collection:
+                    continue
+
                 scryfall_set = get_scryfall_set_lang(
                     api_base,
                     lang,
                     set_id
                 )
                 name = (scryfall_set or {}).get("name", "")
-                time.sleep(0.08)
+                time.sleep(0.15)
 
             if not name:
-                continue
-
-            existing_translation = translations_by_collection_lang.get(
-                (collection_id, lang_id)
-            )
-            if existing_translation and not is_new_collection:
                 continue
 
             translation, is_new = upsert_translation(
