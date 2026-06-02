@@ -344,13 +344,12 @@ def sync():
             if not lang_id:
                 continue
 
-            existing_translation = None
+            existing_translation = translations_by_collection_lang.get(
+                (collection_id, lang_id)
+            )
             if lang == "en":
                 name = en_name
             else:
-                existing_translation = translations_by_collection_lang.get(
-                    (collection_id, lang_id)
-                )
                 if existing_translation and not is_new_collection:
                     continue
 
