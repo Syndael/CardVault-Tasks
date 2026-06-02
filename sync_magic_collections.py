@@ -307,86 +307,98 @@ def sync():
     }
 
     for i, item in enumerate(all_sets):
-        set_id = item["code"]
-        en_name = item.get("name", "")
-        print(
-            f"  [{i + 1:>4}/{len(all_sets)}] "
-            f"{set_id:<12} {en_name:<40}",
-            end="",
-            flush=True
-        )
-
-        collection = collections_by_code.get(set_id)
-        if collection:
-            stats["existing_cols"] += 1
-            tag = "Exists"
-            is_new_collection = False
-        else:
-            collection = create_collection(
-                card_type_id,
-                set_id,
-                item.get("released_at")
+        try:
+            set_id = item["code"]
+            en_name = item.get("name", "")
+            print(
+                f"  [{i + 1:>4}/{len(all_sets)}] "
+                f"{set_id:<12} {en_name:<40}",
+                end="",
+                flush=True
             )
-            collections_by_code[set_id] = collection
-            stats["new_cols"] += 1
-            tag = "New"
-            is_new_collection = True
 
-        translations_added = []
-        collection_id = collection["id"]
-
-        for lang in api_lang:
-            db_abr = db_lang.get(lang)
-            if not db_abr:
-                continue
-
-            lang_id = lang_ids.get(db_abr)
-            if not lang_id:
-                continue
-
-            existing_translation = translations_by_collection_lang.get(
-                (collection_id, lang_id)
-            )
-            if lang == "en":
-                name = en_name
+            collection = collections_by_code.get(set_id)
+            if collection:
+                stats["existing_cols"] += 1
+                tag = "Exists"
+                is_new_collection = False
             else:
-                if existing_translation and not is_new_collection:
+                collection = create_collection(
+                    card_type_id,
+                    set_id,
+                    item.get("released_at")
+                )
+                collections_by_code[set_id] = collection
+                stats["new_cols"] += 1
+                tag = "New"
+                is_new_collection = True
+
+            if not collection:
+                print(f" [ERROR] collection is None")
+                stats["error_cols"] = stats.get("error_cols", 0) + 1
+                continue
+
+            translations_added = []
+            collection_id = collection["id"]
+
+            for lang in api_lang:
+                db_abr = db_lang.get(lang)
+                if not db_abr:
                     continue
 
-                scryfall_set = get_scryfall_set_lang(
-                    api_base,
-                    lang,
-                    set_id
+                lang_id = lang_ids.get(db_abr)
+                if not lang_id:
+                    continue
+
+                existing_translation = translations_by_collection_lang.get(
+                    (collection_id, lang_id)
                 )
-                name = (scryfall_set or {}).get("name", "")
-                time.sleep(0.15)
+                if lang == "en":
+                    name = en_name
+                else:
+                    if existing_translation and not is_new_collection:
+                        continue
 
-            if not name:
-                continue
+                    scryfall_set = get_scryfall_set_lang(
+                        api_base,
+                        lang,
+                        set_id
+                    )
+                    name = (scryfall_set or {}).get("name", "")
+                    time.sleep(0.15)
 
-            translation, is_new = upsert_translation(
-                existing_translation,
-                collection_id,
-                lang_id,
-                name
-            )
-            translations_by_collection_lang[(collection_id, lang_id)] = (
-                translation
-            )
-            translations_added.append(lang)
+                if not name:
+                    continue
 
-            if is_new:
-                stats["new_trans"] += 1
-            else:
-                stats["updated_trans"] += 1
+                translation, is_new = upsert_translation(
+                    existing_translation,
+                    collection_id,
+                    lang_id,
+                    name
+                )
+                translations_by_collection_lang[(collection_id, lang_id)] = (
+                    translation
+                )
+                translations_added.append(lang)
 
-        print(f" [{tag}] trans({','.join(translations_added) or '-'})")
+                if is_new:
+                    stats["new_trans"] += 1
+                else:
+                    stats["updated_trans"] += 1
+
+            print(f" [{tag}] trans({','.join(translations_added) or '-'})")
+        except Exception as e:
+            import traceback
+            print(f" [ERROR] {e}")
+            print(traceback.format_exc())
+            stats["error_cols"] = stats.get("error_cols", 0) + 1
 
     print(f"\n{SEP}")
     print(f"  New cols:       {stats['new_cols']}")
     print(f"  Existing cols:  {stats['existing_cols']}")
     print(f"  New trans:      {stats['new_trans']}")
     print(f"  Updated trans:  {stats['updated_trans']}")
+    print(f"  Errors:         {stats.get('error_cols', 0)}")
     print(SEP + "\n")
 
 

@@ -204,9 +204,10 @@ def run_execution(execution):
         if not os.path.isabs(script_path):
             script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_path)
 
+        TASK_TIMEOUT = 14400
         result = subprocess.run(
             [sys.executable, script_path],
-            capture_output=True, text=True, timeout=3600,
+            capture_output=True, text=True, timeout=TASK_TIMEOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
         output = result.stdout
@@ -223,7 +224,7 @@ def run_execution(execution):
         update_execution(exec_id, status, finished_at=dt_to_str(datetime.now()), output=output)
     except subprocess.TimeoutExpired:
         update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()),
-                         output="Timeout after 3600s")
+                         output=f"Timeout after {TASK_TIMEOUT}s")
         log.error("'%s' timed out", task_name)
     except Exception as e:
         update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=str(e))
