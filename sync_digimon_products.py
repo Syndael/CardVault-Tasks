@@ -26,6 +26,12 @@ PARAM_KEY_FILES_PATH = "sync.digimon.products.img.path"
 PARAM_KEY_IMG_PATH_PATTERN = "sync.digimon.products.img.path.pattern"
 SEP = "=" * 58
 
+_URL_GLOBAL_OLD = "https://world.digimoncard.com/images/cardlist/card"
+_URL_BANDAI = "https://s3.amazonaws.com/prod.bandaitcgplus.files.api/card_image/DG-EN"
+_URL_JP = "https://digimoncard.com/images/cardlist/card"
+_URL_DIGIMON_IO = "https://images.digimoncard.io/images/cards"
+_IMG_EXT = ".png"
+
 _token: str | None = None
 _token_expires_at: datetime | None = None
 
@@ -154,16 +160,56 @@ def get_lang_maps(languages):
 
 
 def get_existing_images(files, product_id):
-    return {f["language_id"] for f in files if f.get("product_id") == product_id}
+    result = set()
+    for f in files:
+        pid = f.get("product_id")
+        if pid is None:
+            pid_obj = f.get("product")
+            pid = pid_obj.get("id") if isinstance(pid_obj, dict) else None
+        if pid == product_id:
+            lang_id = f.get("language_id")
+            if lang_id is None:
+                lang_obj = f.get("language")
+                lang_id = lang_obj.get("id") if isinstance(lang_obj, dict) else None
+            if lang_id is not None:
+                result.add(lang_id)
+    return result
 
 
-def download_file(url):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "CardVault/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-    except Exception:
-        return None
+def _build_image_urls(card_id, set_code):
+    urls = []
+    for fmt in (
+        card_id,
+        f"{card_id}_dummy",
+        f"e_{card_id}_dummy",
+        f"e_{card_id}_D",
+        f"e_{card_id}_D_sam",
+    ):
+        urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
+    if "_P" in card_id:
+        std_id = card_id.rsplit("_P", 1)[0]
+        for fmt in (
+            f"e_{std_id}p_D",
+            f"e_{std_id}P_D_sam",
+            f"{std_id}P_dummy",
+            f"{std_id}P",
+        ):
+            urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
+    urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
+    urls.append(f"{_URL_JP}/{card_id}{_IMG_EXT}")
+    urls.append(f"{_URL_DIGIMON_IO}/{urllib.parse.quote(card_id)}.jpg")
+    return urls
+
+
+def try_download_image(card_id, set_code):
+    for url in _build_image_urls(card_id, set_code):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CardVault/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read(), url
+        except Exception:
+            pass
+    return None, None
 
 
 def sync():
@@ -229,6 +275,16 @@ def sync():
                 candidates.append(f"{set_code}-{n:02d}")
             except ValueError:
                 pass
+            if "_P" in pnum:
+                base = pnum.split("_P")[0]
+                fallbacks = [f"{set_code}-{base}"]
+                try:
+                    n = int(base)
+                    fallbacks.append(f"{set_code}-{n:03d}")
+                    fallbacks.append(f"{set_code}-{n:02d}")
+                except ValueError:
+                    pass
+                candidates.extend(fallbacks)
             seen = set()
             for c in candidates:
                 if c in seen:
@@ -236,8 +292,10 @@ def sync():
                 seen.add(c)
                 try:
                     data = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(c)}")
-                    if data and isinstance(data, list) and len(data) > 0 and data[0].get("id") == c:
-                        return c, data
+                    if data and isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and item.get("id") == c:
+                                return c, data
                 except urllib.error.HTTPError:
                     pass
             return None, None
@@ -279,9 +337,6 @@ def sync():
             img_results = []
             existing_img_lang_ids = img_by_product.get(product_id, set())
 
-            en_img_url = f"https://images.digimoncard.io/images/cards/{urllib.parse.quote(card_id)}.jpg"
-            per_lang_img_url = {"en": en_img_url}
-
             is_manual_val = "1" if product.get("product_is_manual") else "0"
             sub_dir = img_path_pattern.replace("{card_type}", card_type).replace("{is_manual}", is_manual_val).replace("{collection_code}", set_code)
             base_dir = files_path if os.path.isabs(files_path) else os.path.join(_API_ROOT, files_path)
@@ -295,17 +350,13 @@ def sync():
                     stats["img_skip"] += 1
                     continue
 
-                img_url_to_dl = per_lang_img_url.get(code)
-                if not img_url_to_dl:
-                    img_results.append(f"{code}=—")
-                    continue
-
-                image_data = download_file(img_url_to_dl)
+                image_data, used_url = try_download_image(card_id, set_code)
                 if image_data is None:
                     img_results.append(f"{code}=—")
                     continue
 
-                original_name = f"{card_id}_{code}.jpg"
+                ext = used_url.rsplit(".", 1)[-1] if used_url else "jpg"
+                original_name = f"{card_id}_{code}.{ext}"
                 stored_name = original_name
                 local_rel = os.path.join(files_path, sub_dir, stored_name)
                 local_abs = os.path.join(base_dir, sub_dir, stored_name)

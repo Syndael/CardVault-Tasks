@@ -142,11 +142,14 @@ def main():
 
     print("  Fetching existing files...")
     all_files = api_get_all("files", {"per_page": 500})
-    product_ids_with_files = {
-        f["product_id"]
-        for f in all_files
-        if f.get("product_id") is not None
-    }
+    product_ids_with_files = set()
+    for f in all_files:
+        pid = f.get("product_id")
+        if pid is None:
+            pid_obj = f.get("product")
+            pid = pid_obj.get("id") if isinstance(pid_obj, dict) else None
+        if pid is not None:
+            product_ids_with_files.add(pid)
     print(f"  Products with at least one file: {len(product_ids_with_files)}\n")
 
     updated = 0
