@@ -176,7 +176,7 @@ def get_existing_images(files, product_id):
     return result
 
 
-def _build_image_urls(card_id, set_code):
+def _build_en_urls(card_id, set_code):
     urls = []
     for fmt in (
         card_id,
@@ -196,13 +196,16 @@ def _build_image_urls(card_id, set_code):
         ):
             urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
     urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
-    urls.append(f"{_URL_JP}/{card_id}{_IMG_EXT}")
     urls.append(f"{_URL_DIGIMON_IO}/{urllib.parse.quote(card_id)}.jpg")
     return urls
 
 
-def try_download_image(card_id, set_code):
-    for url in _build_image_urls(card_id, set_code):
+def _build_jp_urls(card_id):
+    return [f"{_URL_JP}/{card_id}{_IMG_EXT}"]
+
+
+def _try_download_first(urls):
+    for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "CardVault/1.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -210,6 +213,14 @@ def try_download_image(card_id, set_code):
         except Exception:
             pass
     return None, None
+
+
+def try_download_image_en(card_id, set_code):
+    return _try_download_first(_build_en_urls(card_id, set_code))
+
+
+def try_download_image_jp(card_id, _=None):
+    return _try_download_first(_build_jp_urls(card_id))
 
 
 def sync():
@@ -350,7 +361,10 @@ def sync():
                     stats["img_skip"] += 1
                     continue
 
-                image_data, used_url = try_download_image(card_id, set_code)
+                if code == "ja":
+                    image_data, used_url = try_download_image_jp(card_id)
+                else:
+                    image_data, used_url = try_download_image_en(card_id, set_code)
                 if image_data is None:
                     img_results.append(f"{code}=—")
                     continue

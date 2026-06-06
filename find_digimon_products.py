@@ -165,7 +165,9 @@ def get_lang_maps(languages):
     return by_abr
 
 
-def _build_image_urls(card_id, set_code):
+# ── URL builders ──────────────────────────────────────
+
+def _build_en_urls(card_id, set_code):
     urls = []
     for fmt in (
         card_id,
@@ -185,9 +187,12 @@ def _build_image_urls(card_id, set_code):
         ):
             urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
     urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
-    urls.append(f"{_URL_JP}/{card_id}{_IMG_EXT}")
     urls.append(f"{_URL_DIGIMON_IO}/{urllib.parse.quote(card_id)}.jpg")
     return urls
+
+
+def _build_jp_urls(card_id):
+    return [f"{_URL_JP}/{card_id}{_IMG_EXT}"]
 
 
 def download_file(url):
@@ -199,23 +204,42 @@ def download_file(url):
         return None
 
 
-def try_download_image(card_id, set_code):
-    for url in _build_image_urls(card_id, set_code):
+def try_download_first(urls):
+    for url in urls:
         data = download_file(url)
         if data:
             return data, url
     return None, None
 
 
-def check_image_exists(card_id, set_code):
-    for url in _build_image_urls(card_id, set_code):
-        try:
-            req = urllib.request.Request(url, method="HEAD")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
+def try_download_image_en(card_id, set_code):
+    return try_download_first(_build_en_urls(card_id, set_code))
+
+
+def try_download_image_jp(card_id, _=None):
+    return try_download_first(_build_jp_urls(card_id))
+
+
+def check_url_exists(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def check_image_exists_en(card_id, set_code):
+    for url in _build_en_urls(card_id, set_code):
+        if check_url_exists(url):
+            return True
+    return False
+
+
+def check_image_exists_jp(card_id):
+    for url in _build_jp_urls(card_id):
+        if check_url_exists(url):
+            return True
     return False
 
 
@@ -242,14 +266,14 @@ def get_collection_code(cardnumber):
 
 
 def download_and_register_image(product_id, card_id, set_code, lang_id,
-                                image_file_type_id, files_path, img_path_pattern, card_type):
-    image_data, source_url = try_download_image(card_id, set_code)
+                                image_file_type_id, files_path, img_path_pattern, card_type,
+                                try_download_fn, lang_suffix="en"):
+    image_data, source_url = try_download_fn(card_id, set_code)
     if image_data is None:
         return False
-    print(f" src={source_url}", end="", flush=True)
 
     ext = os.path.splitext(urllib.parse.urlparse(source_url).path)[1] or ".png"
-    original_name = f"{card_id}_en{ext}"
+    original_name = f"{card_id}_{lang_suffix}{ext}"
     stored_name = original_name
     sub_dir = img_path_pattern.replace("{card_type}", card_type).replace("{is_manual}", "0").replace("{collection_code}", set_code)
     base_dir = files_path if os.path.isabs(files_path) else os.path.join(_API_ROOT, files_path)
@@ -282,11 +306,40 @@ def find_missing_alt_arts(set_code, standard_numbers, existing_numbers):
             if alt_num in existing_numbers:
                 continue
             alt_id = f"{set_code}-{alt_num}"
-            if check_image_exists(alt_id, set_code):
+            if check_image_exists_en(alt_id, set_code):
                 found.append(alt_num)
             else:
                 break
     return found
+
+
+def _create_product(set_code, num, collection, card_type_id):
+    result = api_post("products", {
+        "collection_id": collection["id"],
+        "product_type_id": card_type_id,
+        "product_number": num,
+    })
+    if not result:
+        return None
+    return result.get("id")
+
+
+def _try_register_image(product_id, card_id, set_code, lang_id,
+                        image_file_type_id, files_path, img_path_pattern, card_type,
+                        try_download_fn, lang_suffix, existing_lang_ids, stats):
+    if lang_id and lang_id not in existing_lang_ids:
+        ok = download_and_register_image(
+            product_id, card_id, set_code, lang_id,
+            image_file_type_id, files_path, img_path_pattern, card_type,
+            try_download_fn, lang_suffix
+        )
+        if ok:
+            stats["images_downloaded"] += 1
+            return "ok"
+        stats["images_skipped"] += 1
+        return "fail"
+    stats["images_skipped"] += 1
+    return "skip"
 
 
 def sync():
@@ -315,8 +368,9 @@ def sync():
     card_type_id = get_card_type_id(types, card_type)
     languages = api_get_all("languages")
     lang_by_abr = get_lang_maps(languages)
-    image_codes = [c for c in migration_languages.split(";") if c in lang_by_abr]
     en_lang_id = lang_by_abr.get("en")
+    jp_lang_id = lang_by_abr.get("ja")
+    image_codes = [c for c in migration_languages.split(";") if c in lang_by_abr]
 
     image_file_type_id = None
     for t in types:
@@ -338,10 +392,14 @@ def sync():
         "product_type_id": card_type_id, "per_page": 200
     })
     existing_by_collection = {}
+    existing_product_map = {}
     for p in existing_products:
         code = p.get("collection_code", "")
         num = p.get("product_number", "")
         existing_by_collection.setdefault(code, set()).add(num)
+        pid = p.get("product_id") or p.get("id")
+        if pid:
+            existing_product_map[(code, num)] = pid
     total_existing = len(existing_products)
     print(f"  {total_existing} existing products")
 
@@ -379,6 +437,7 @@ def sync():
         "new_standard": 0,
         "existing_standard": 0,
         "alt_arts_created": 0,
+        "jp_images_added": 0,
         "images_downloaded": 0,
         "images_skipped": 0,
         "errors": 0,
@@ -396,44 +455,7 @@ def sync():
         all_set_codes = [c for c in all_set_codes if c in filter_collections]
         print(f"  Filtered to {len(all_set_codes)} collections: {', '.join(all_set_codes)}")
 
-    def _create_product_and_image(set_code, num, collection, card_type_id, en_lang_id_local):
-        nonlocal stats
-        card_id = f"{set_code}-{num}"
-        try:
-            result = api_post("products", {
-                "collection_id": collection["id"],
-                "product_type_id": card_type_id,
-                "product_number": num,
-            })
-            if not result:
-                print(f"    ! {card_id:<26} failed to create")
-                stats["errors"] += 1
-                return None
-            product_id = result.get("id")
-            print(f"    + {card_id:<26} created (id={product_id})", end="", flush=True)
-
-            existing_lang_ids = existing_images_by_product.get(product_id, set())
-            if en_lang_id_local and en_lang_id_local not in existing_lang_ids:
-                ok = download_and_register_image(
-                    product_id, card_id, set_code, en_lang_id_local,
-                    image_file_type_id, files_path, img_path_pattern, card_type
-                )
-                if ok:
-                    stats["images_downloaded"] += 1
-                    print(f" img=ok")
-                else:
-                    stats["images_skipped"] += 1
-                    print(f" img=fail")
-            else:
-                stats["images_skipped"] += 1
-                print(f" img=skip")
-            return product_id
-        except Exception as e:
-            print(f"    ! {card_id:<26} error: {e}")
-            stats["errors"] += 1
-            return None
-
-    # Phase 1: create missing standard cards from API data
+    # ── Phase 1: Create missing standard cards + download images ──
     print(f"\n{'=' * 58}")
     print(f"  Phase 1: Create missing standard cards + download images")
     print(f"{'=' * 58}")
@@ -464,10 +486,31 @@ def sync():
             if not search_result or not isinstance(search_result, list) or not search_result:
                 continue
 
-            pid = _create_product_and_image(set_code, num, collection, card_type_id, en_lang_id)
-            if pid:
-                existing_nums.add(num)
-                new_for_set += 1
+            card_id = f"{set_code}-{num}"
+
+            product_id = _create_product(set_code, num, collection, card_type_id)
+            if not product_id:
+                print(f"    ! {card_id:<26} failed to create")
+                stats["errors"] += 1
+                continue
+
+            print(f"    + {card_id:<26} created (id={product_id})", end="", flush=True)
+            existing_nums.add(num)
+            new_for_set += 1
+
+            existing_lang_ids = existing_images_by_product.get(product_id, set())
+
+            en_st = _try_register_image(
+                product_id, card_id, set_code, en_lang_id,
+                image_file_type_id, files_path, img_path_pattern, card_type,
+                try_download_image_en, "en", existing_lang_ids, stats
+            )
+            jp_st = _try_register_image(
+                product_id, card_id, set_code, jp_lang_id,
+                image_file_type_id, files_path, img_path_pattern, card_type,
+                try_download_image_jp, "jp", existing_lang_ids, stats
+            )
+            print(f" en={en_st} jp={jp_st}")
 
             time.sleep(0.1)
 
@@ -475,7 +518,57 @@ def sync():
             print(f"  {set_code}: +{new_for_set} new standard cards")
         stats["new_standard"] += new_for_set
 
-    # Phase 2: detect and create alt arts + download images
+    # ── Phase 1.5: Add JP images to existing standard products ──
+    print(f"\n{'=' * 58}")
+    print(f"  Phase 1.5: Add JP images to existing standard products")
+    print(f"{'=' * 58}")
+
+    jp_added_count = 0
+    for set_code in all_set_codes:
+        if set_code not in known_collections:
+            continue
+
+        existing_nums = existing_by_collection.get(set_code, set())
+
+        standard_nums = sorted({
+            get_standard_number(cn)
+            for cn in groups[set_code]
+            if is_standard_card(cn)
+        })
+
+        for num in standard_nums:
+            if num not in existing_nums:
+                continue
+
+            product_id = existing_product_map.get((set_code, num))
+            if not product_id:
+                continue
+
+            existing_lang_ids = existing_images_by_product.get(product_id, set())
+            if not jp_lang_id or jp_lang_id in existing_lang_ids:
+                continue
+
+            card_id = f"{set_code}-{num}"
+            print(f"    ~ {card_id:<26} existing (id={product_id})", end="", flush=True)
+
+            jp_st = _try_register_image(
+                product_id, card_id, set_code, jp_lang_id,
+                image_file_type_id, files_path, img_path_pattern, card_type,
+                try_download_image_jp, "jp", existing_lang_ids, stats
+            )
+            existing_images_by_product.setdefault(product_id, set()).add(jp_lang_id)
+            print(f" jp={jp_st}")
+
+            if jp_st == "ok":
+                jp_added_count += 1
+
+            time.sleep(0.1)
+
+    if jp_added_count:
+        print(f"\n  JP images added to {jp_added_count} existing products")
+    stats["jp_images_added"] += jp_added_count
+
+    # ── Phase 2: Detect and create alt arts + download images ──
     print(f"\n{'=' * 58}")
     print(f"  Phase 2: Detect and create alt arts + download images")
     print(f"{'=' * 58}")
@@ -500,10 +593,50 @@ def sync():
         for idx, alt_num in enumerate(alt_nums, 1):
             if idx % 10 == 0 or idx == total_alts:
                 print(f"  {set_code}: alt art {idx}/{total_alts}")
-            pid = _create_product_and_image(set_code, alt_num, collection, card_type_id, en_lang_id)
-            if pid:
+
+            card_id = f"{set_code}-{alt_num}"
+
+            # EN product + image
+            en_pid = _create_product(set_code, alt_num, collection, card_type_id)
+            if en_pid:
+                print(f"    + {card_id:<26} created (id={en_pid})", end="", flush=True)
                 existing_nums.add(alt_num)
                 new_alts += 1
+
+                existing_lang_ids = existing_images_by_product.get(en_pid, set())
+                en_st = _try_register_image(
+                    en_pid, card_id, set_code, en_lang_id,
+                    image_file_type_id, files_path, img_path_pattern, card_type,
+                    try_download_image_en, "en", existing_lang_ids, stats
+                )
+                print(f" en={en_st}")
+            else:
+                print(f"    ! {card_id:<26} EN failed to create")
+                stats["errors"] += 1
+
+            # JP product + image (separate product with JP suffix)
+            if jp_lang_id:
+                jp_num = f"{alt_num}JP"
+                if jp_num not in existing_nums and check_image_exists_jp(card_id):
+                    jp_pid = _create_product(set_code, jp_num, collection, card_type_id)
+                    if jp_pid:
+                        print(f"    + {card_id:<26}JP created (id={jp_pid})", end="", flush=True)
+                        existing_nums.add(jp_num)
+
+                        ok = download_and_register_image(
+                            jp_pid, card_id, set_code, jp_lang_id,
+                            image_file_type_id, files_path, img_path_pattern, card_type,
+                            try_download_image_jp, "jp"
+                        )
+                        if ok:
+                            stats["images_downloaded"] += 1
+                            print(f" jp=ok")
+                        else:
+                            stats["images_skipped"] += 1
+                            print(f" jp=fail")
+                    else:
+                        print(f"    ! {card_id:<26}JP failed to create")
+                        stats["errors"] += 1
 
             time.sleep(0.1)
 
@@ -515,6 +648,7 @@ def sync():
     print(f"  New standard:       {stats['new_standard']}")
     print(f"  Existing standard:  {stats['existing_standard']}")
     print(f"  Alt arts created:   {stats['alt_arts_created']}")
+    print(f"  JP images added:    {stats['jp_images_added']}")
     print(f"  Images downloaded:  {stats['images_downloaded']}")
     print(f"  Images skipped:     {stats['images_skipped']}")
     print(f"  Errors:             {stats['errors']}")
