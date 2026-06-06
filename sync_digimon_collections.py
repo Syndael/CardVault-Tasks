@@ -74,6 +74,15 @@ def fetch_json(url):
         return None
 
 
+def _extract_set_names(card):
+    raw = card.get("set_name") or []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        return [raw]
+    return []
+
+
 def api_request(method, path, data=None):
     clean_path = path.strip("/")
     if "?" in clean_path:
@@ -175,8 +184,113 @@ def _sample_cardnumbers(cardnumbers):
     return [cardnumbers[i] for i in sorted(indices)]
 
 
+def _fetch_all_cards(api_base):
+    cards = []
+    url = f"{api_base.rstrip('/')}/getAllCards"
+    page = 1
+    while True:
+        page_url = f"{url}?page={page}&per_page=500" if page > 1 else url
+        data = fetch_json(page_url)
+        if not data:
+            break
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("cards") or data.get("data") or []
+            if not items and page == 1:
+                items = [v for v in data.values() if isinstance(v, dict) and "cardnumber" in v]
+            if not items:
+                break
+            cards.extend(items)
+            pagination = data.get("pagination") or {}
+            if not pagination.get("has_next"):
+                break
+        elif isinstance(data, list):
+            cards.extend(data)
+            break
+        else:
+            break
+        page += 1
+    return cards
+
+
+def _search_set(api_base, card_id):
+    rep = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(card_id)}")
+    if rep and isinstance(rep, list) and len(rep) > 0:
+        return rep[0]
+    return None
+
+
+def _make_set_entry(prefix, card, api_base):
+    if card is None:
+        return {"set_code": prefix, "set_name": prefix, "release_date": None}
+    set_names = _extract_set_names(card)
+    name = _normalize_name(_match_set_name(set_names, prefix))
+    if not name or name == prefix:
+        m = re.match(r"^[A-Za-z0-9_-]+:\s*(.*)", set_names[0]) if set_names else None
+        name = _normalize_name(m.group(1) if m else (set_names[0] if set_names else prefix))
+    return {
+        "set_code": prefix,
+        "set_name": name,
+        "release_date": (card.get("date_added") or "")[:10] or None
+    }
+
+
+def _suffix_digits(groups, prefix):
+    cardnumbers = groups.get(prefix, [])
+    for cn in cardnumbers:
+        parts = cn.split("-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return len(parts[1])
+    return 3
+
+
+def _discover_missing_sets(api_base, known_prefixes, groups):
+    """Probe search API to find sets missing from getAllCards."""
+    found = {}
+
+    num_patterns = {}
+    for p in known_prefixes:
+        m = re.match(r"^([A-Za-z]+)(\d+)$", p)
+        if m:
+            base = m.group(1).upper()
+            num = int(m.group(2))
+            num_patterns.setdefault(base, set()).add(num)
+
+    for base, nums in num_patterns.items():
+        min_n = min(nums)
+        max_n = max(nums) + 5
+        probe_prefixes = sorted(p for p in known_prefixes if re.match(rf"^{base}\d+$", p))
+        digits = None
+        for pp in probe_prefixes:
+            d = _suffix_digits(groups, pp)
+            if d is not None:
+                digits = d
+                break
+        if digits is None:
+            digits = 3
+
+        for n in range(min_n, max_n + 1):
+            candidate = f"{base}{n}"
+            if candidate in known_prefixes:
+                continue
+            probe_id = f"{candidate}-{str(1).zfill(digits)}"
+            time.sleep(0.1)
+            card = _search_set(api_base, probe_id)
+            if card:
+                entry = _make_set_entry(candidate, card, api_base)
+                found[candidate] = entry
+                print(f"    ~ discovered {candidate}: {entry['set_name']}")
+            if n > max(nums) and card is None:
+                probe_id2 = f"{candidate}-{str(2).zfill(digits)}"
+                time.sleep(0.1)
+                card2 = _search_set(api_base, probe_id2)
+                if card2 is None:
+                    break
+
+    return found
+
+
 def get_digimon_sets(api_base):
-    cards = fetch_json(f"{api_base.rstrip('/')}/getAllCards")
+    cards = _fetch_all_cards(api_base)
     if not cards:
         return []
 
@@ -188,43 +302,80 @@ def get_digimon_sets(api_base):
         if prefix:
             groups.setdefault(prefix, []).append(cn)
 
+    known_prefixes = set(groups.keys())
+    print(f"    {len(known_prefixes)} prefixes from getAllCards, probing for gaps...")
+    missing = _discover_missing_sets(api_base, known_prefixes, groups)
+
+    def _strip_pad(code):
+        m = re.match(r"^([A-Za-z]+)(\d+)$", code)
+        if m:
+            return m.group(1) + str(int(m.group(2)))
+        return code
+
+    known_bases = set()
+    for p in known_prefixes:
+        m = re.match(r"^([A-Za-z]+)", p)
+        if m:
+            known_bases.add(m.group(1).upper())
+
     result = []
+    known_set_codes = known_prefixes | set(missing.keys())
+    known_normalized = {_strip_pad(c) for c in known_set_codes}
+    known_names = set()
+    extra_sets = {}
+
     for prefix in sorted(groups):
         cardnumbers = sorted(groups[prefix])
-        sampled = None
+        card = None
         for cn in _sample_cardnumbers(cardnumbers):
             time.sleep(0.1)
-            rep = fetch_json(
-                f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(cn)}"
-            )
-            if rep and isinstance(rep, list) and len(rep) > 0:
-                card = rep[0]
-                set_names = card.get("set_name") or []
-                name = _normalize_name(_match_set_name(set_names, prefix))
-                if name and name != prefix:
-                    sampled = {
-                        "set_code": prefix,
-                        "set_name": name,
-                        "release_date": (card.get("date_added") or "")[:10] or None
+            card = _search_set(api_base, cn)
+            if card:
+                entry = _make_set_entry(prefix, card, api_base)
+                result.append(entry)
+                if entry:
+                    known_names.add(entry.get("set_name", ""))
+                for sn_entry in _extract_set_names(card):
+                    m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)", sn_entry)
+                    if not m:
+                        continue
+                    code_raw = m.group(1)
+                    name = m.group(2).strip()
+                    code = code_raw.replace("-", "")
+                    m_code = re.match(r"^([A-Za-z]+)(\d+)$", code)
+                    if not m_code:
+                        continue
+                    if len(m_code.group(2)) > 2:
+                        continue
+                    letter_part = m_code.group(1).upper()
+                    if letter_part not in known_bases:
+                        continue
+                    stripped = letter_part + str(int(m_code.group(2)))
+                    if stripped in known_normalized:
+                        continue
+                    if stripped in {_strip_pad(c) for c in extra_sets}:
+                        continue
+                    norm_name = _normalize_name(name)
+                    if norm_name in known_names:
+                        continue
+                    extra_sets[code] = {
+                        "set_code": code,
+                        "set_name": norm_name,
+                        "release_date": None
                     }
-                    break
-        if not sampled:
-            rep2 = fetch_json(
-                f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(cardnumbers[0])}"
-            )
-            if rep2 and isinstance(rep2, list) and len(rep2) > 0:
-                card = rep2[0]
-                set_names = card.get("set_name") or []
-                m = re.match(r"^[A-Za-z0-9_-]+:\s*(.*)", set_names[0]) if set_names else None
-                name = _normalize_name(m.group(1) if m else (set_names[0] if set_names else prefix))
-                sampled = {
-                    "set_code": prefix,
-                    "set_name": name,
-                    "release_date": (card.get("date_added") or "")[:10] or None
-                }
-            else:
-                sampled = {"set_code": prefix, "set_name": prefix, "release_date": None}
-        result.append(sampled)
+                    print(f"    ~ discovered via set_name: {code}: {norm_name}")
+                break
+        else:
+            entry = _make_set_entry(prefix, card, api_base)
+            result.append(entry)
+
+    for prefix in sorted(missing):
+        result.append(missing[prefix])
+
+    for prefix in sorted(extra_sets):
+        if prefix not in missing:
+            result.append(extra_sets[prefix])
+
     return result
 
 
@@ -325,10 +476,32 @@ def sync():
     print("\n  Getting sets from Digimon TCG API...")
     print("  Fetching all cards to extract set list...")
     all_sets = get_digimon_sets(api_base)
-    print(f"  {len(all_sets)} sets found\n")
+    api_codes = {s["set_code"] for s in all_sets}
+    print(f"  {len(all_sets)} sets found via API")
 
-    if not all_sets:
-        sys.exit(1)
+    # Add local collections not returned by the external API (e.g. ST11)
+    orphan_count = 0
+    for code in sorted(collections_by_code):
+        if code not in api_codes:
+            col = collections_by_code[code]
+            # Try to get the English name from existing translations
+            name = code
+            for col_id in [col["id"]]:
+                for (cid, lid), trans in translations_by_collection_lang.items():
+                    if cid == col_id:
+                        name = trans.get("name", code)
+                        break
+            all_sets.append({
+                "set_code": code,
+                "set_name": name,
+                "release_date": col.get("release_date"),
+            })
+            orphan_count += 1
+    if orphan_count:
+        all_sets.sort(key=lambda x: x["set_code"])
+        print(f"  +{orphan_count} local-only collections (not in API)\n")
+    else:
+        print()
 
     stats = {"new_cols": 0, "existing_cols": 0, "new_trans": 0, "updated_trans": 0}
 
