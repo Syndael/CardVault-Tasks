@@ -278,6 +278,11 @@ def sync():
         product_number = product["product_number"]
         set_code = product["collection_code"]
 
+        if product_number.endswith("JP"):
+            print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  JP product, skipping")
+            api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
+            continue
+
         def _find_card_id(pnum):
             candidates = [f"{set_code}-{pnum}"]
             try:
