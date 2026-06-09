@@ -279,8 +279,44 @@ def sync():
         set_code = product["collection_code"]
 
         if product_number.endswith("JP"):
-            print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  JP product, skipping")
-            api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
+            print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  JP product", end="", flush=True)
+            card_id, card_data = _find_card_id(product_number.replace("JP", "").strip())
+            if card_id and card_data:
+                en_name = card_data[0]["name"]
+                print(f" {en_name:<36} trans:", end="", flush=True)
+                translations = {}
+                for code in image_codes:
+                    lang_id = lang_by_abr[code]
+                    if code == "en":
+                        translations["en"] = {"name": en_name, "lang_id": lang_id}
+                        continue
+                    try:
+                        t = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(card_id)}")
+                    except Exception:
+                        continue
+                    if t and isinstance(t, list) and len(t) > 0 and t[0].get("name"):
+                        translations[code] = {"name": t[0]["name"], "lang_id": lang_id}
+                    time.sleep(0.05)
+                print(f"[{','.join(translations.keys())}]", end="", flush=True)
+                for code, t in translations.items():
+                    existing = api_get("product-translations", {
+                        "product_id": product_id, "language_id": t["lang_id"], "per_page": 1
+                    })
+                    existing_items = (existing or {}).get("items", [])
+                    if existing_items:
+                        api_request("PATCH", f"product-translations/{existing_items[0]['id']}", {"name": t["name"]})
+                    else:
+                        api_request("POST", "product-translations", {
+                            "product_id": product_id, "language_id": t["lang_id"], "name": t["name"]
+                        })
+                    stats["trans"] += 1
+                print("  img:[skip]")
+                api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
+                stats["cards_ok"] += 1
+            else:
+                print("  not found in API")
+                stats["not_found"] += 1
+                api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
             continue
 
         def _find_card_id(pnum):
