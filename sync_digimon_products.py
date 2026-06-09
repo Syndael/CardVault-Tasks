@@ -223,6 +223,40 @@ def try_download_image_jp(card_id, _=None):
     return _try_download_first(_build_jp_urls(card_id))
 
 
+def _find_card_id(pnum, set_code, api_base):
+    candidates = [f"{set_code}-{pnum}"]
+    try:
+        n = int(pnum)
+        candidates.append(f"{set_code}-{n:03d}")
+        candidates.append(f"{set_code}-{n:02d}")
+    except ValueError:
+        pass
+    if "_P" in pnum:
+        base = pnum.split("_P")[0]
+        fallbacks = [f"{set_code}-{base}"]
+        try:
+            n = int(base)
+            fallbacks.append(f"{set_code}-{n:03d}")
+            fallbacks.append(f"{set_code}-{n:02d}")
+        except ValueError:
+            pass
+        candidates.extend(fallbacks)
+    seen = set()
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.add(c)
+        try:
+            data = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(c)}")
+            if data and isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") == c:
+                        return c, data
+        except urllib.error.HTTPError:
+            pass
+    return None, None
+
+
 def sync():
     print(f"\n{SEP}")
     print("  Searching Digimon TCG cards via CardVault API")
@@ -280,7 +314,7 @@ def sync():
 
         if product_number.endswith("JP"):
             print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  JP product", end="", flush=True)
-            card_id, card_data = _find_card_id(product_number.replace("JP", "").strip())
+            card_id, card_data = _find_card_id(product_number.replace("JP", "").strip(), set_code, api_base)
             if card_id and card_data:
                 en_name = card_data[0]["name"]
                 print(f" {en_name:<36} trans:", end="", flush=True)
@@ -319,40 +353,7 @@ def sync():
                 api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
             continue
 
-        def _find_card_id(pnum):
-            candidates = [f"{set_code}-{pnum}"]
-            try:
-                n = int(pnum)
-                candidates.append(f"{set_code}-{n:03d}")
-                candidates.append(f"{set_code}-{n:02d}")
-            except ValueError:
-                pass
-            if "_P" in pnum:
-                base = pnum.split("_P")[0]
-                fallbacks = [f"{set_code}-{base}"]
-                try:
-                    n = int(base)
-                    fallbacks.append(f"{set_code}-{n:03d}")
-                    fallbacks.append(f"{set_code}-{n:02d}")
-                except ValueError:
-                    pass
-                candidates.extend(fallbacks)
-            seen = set()
-            for c in candidates:
-                if c in seen:
-                    continue
-                seen.add(c)
-                try:
-                    data = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(c)}")
-                    if data and isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and item.get("id") == c:
-                                return c, data
-                except urllib.error.HTTPError:
-                    pass
-            return None, None
-
-        card_id, card_data = _find_card_id(product_number)
+        card_id, card_data = _find_card_id(product_number, set_code, api_base)
 
         if set_code != current_set:
             current_set = set_code
