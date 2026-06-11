@@ -65,3 +65,9 @@ VALUES ('Buscar productos Digimon (alt arts)', 'find_digimon_products.py', '0 12
 
 INSERT INTO settings(setting_key, setting_value)
 VALUES ('sync.digimon.products.filter.collections', '');
+
+INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
+VALUES ('Scrapeo PokeCollector (cartas JP)', 'sync_pokemon_pokecollector.py', '0 8 1,15 * *', 1);
+
+INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
+VALUES ('CardMarket checker de precios', 'cardmarket_checker.py', '30 8 1,15 * *', 1);
