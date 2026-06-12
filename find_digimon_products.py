@@ -1,7 +1,10 @@
+import concurrent.futures
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,8 +35,7 @@ _URL_BANDAI = "https://s3.amazonaws.com/prod.bandaitcgplus.files.api/card_image/
 _URL_JP = "https://digimoncard.com/images/cardlist/card"
 _URL_DIGIMON_IO = "https://images.digimoncard.io/images/cards"
 _IMG_EXT = ".png"
-_ALT_MAX = 10
-
+_stats_lock = threading.Lock()
 _token: str | None = None
 _token_expires_at: datetime | None = None
 
@@ -172,6 +174,8 @@ def _build_en_urls(card_id, set_code):
     for fmt in (
         card_id,
         f"{card_id}_dummy",
+        f"{card_id}_D",
+        f"e_{card_id}",
         f"e_{card_id}_dummy",
         f"e_{card_id}_D",
         f"e_{card_id}_D_sam",
@@ -179,11 +183,22 @@ def _build_en_urls(card_id, set_code):
         urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
     if "_P" in card_id:
         std_id = card_id.rsplit("_P", 1)[0]
+        alt_suffix = card_id[len(std_id):]  # e.g. "_P1"
+        if alt_suffix == "_P":
+            for fmt in (
+                f"e_{std_id}p_D",
+                f"e_{std_id}P_D_sam",
+                f"{std_id}P_dummy",
+                f"{std_id}P",
+                f"{std_id}_P",
+                f"e_{std_id}_P",
+                f"e_{std_id}_P_D",
+            ):
+                urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
         for fmt in (
-            f"e_{std_id}p_D",
-            f"e_{std_id}P_D_sam",
-            f"{std_id}P_dummy",
-            f"{std_id}P",
+            f"{std_id}{alt_suffix}",
+            f"e_{std_id}{alt_suffix}",
+            f"e_{std_id}{alt_suffix}_D",
         ):
             urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
     urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
@@ -205,7 +220,11 @@ def download_file(url):
 
 
 def try_download_first(urls):
+    seen_urls = set()
     for url in urls:
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
         data = download_file(url)
         if data:
             return data, url
@@ -222,18 +241,11 @@ def try_download_image_jp(card_id, _=None):
 
 def check_url_exists(url):
     try:
-        req = urllib.request.Request(url, method="HEAD")
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "CardVault/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status == 200
     except Exception:
         return False
-
-
-def check_image_exists_en(card_id, set_code):
-    for url in _build_en_urls(card_id, set_code):
-        if check_url_exists(url):
-            return True
-    return False
 
 
 def check_image_exists_jp(card_id):
@@ -241,6 +253,10 @@ def check_image_exists_jp(card_id):
         if check_url_exists(url):
             return True
     return False
+
+
+def image_digest(image_data):
+    return hashlib.sha256(image_data).hexdigest() if image_data else None
 
 
 def is_alt_card(cardnumber):
@@ -298,19 +314,99 @@ def download_and_register_image(product_id, card_id, set_code, lang_id,
     return result is not None
 
 
-def find_missing_alt_arts(set_code, standard_numbers, existing_numbers):
-    found = []
-    for std_num in standard_numbers:
-        for i in range(1, _ALT_MAX + 1):
-            alt_num = f"{std_num}_P{i}"
-            if alt_num in existing_numbers:
+def _alt_sort_key(alt_num):
+    m = re.match(r"^(.+)_P(\d*)$", alt_num)
+    if not m:
+        return alt_num, -1
+    suffix = m.group(2)
+    return m.group(1), int(suffix) if suffix else 0
+
+
+def _standard_from_alt(alt_num):
+    return alt_num.split("_P", 1)[0]
+
+
+def _download_unique_alt_digest(set_code, alt_num, seen_digests):
+    image_data, _ = try_download_image_en(f"{set_code}-{alt_num}", set_code)
+    digest = image_digest(image_data)
+    if not digest or digest in seen_digests:
+        return None
+    seen_digests.add(digest)
+    return digest
+
+
+def _base_seen_digests(set_code, std_num):
+    image_data, _ = try_download_image_en(f"{set_code}-{std_num}", set_code)
+    digest = image_digest(image_data)
+    return {digest} if digest else set()
+
+
+def _check_std_num_alts(args):
+    set_code, std_num, existing_numbers, found_from_api = args
+    alt_exists = set()
+    seen_digests = _base_seen_digests(set_code, std_num)
+
+    alt_p = f"{std_num}_P"
+    if alt_p not in found_from_api and alt_p not in existing_numbers:
+        if _download_unique_alt_digest(set_code, alt_p, seen_digests):
+            alt_exists.add(alt_p)
+
+    for i in range(1, 11):
+        alt_num = f"{std_num}_P{i}"
+        if alt_num in found_from_api or alt_num in existing_numbers:
+            continue
+        if _download_unique_alt_digest(set_code, alt_num, seen_digests):
+            alt_exists.add(alt_num)
+        else:
+            break
+
+    return alt_exists
+
+
+def _validate_api_alt_arts(set_code, api_alt_nums, standard_numbers):
+    standard_set = set(standard_numbers)
+    by_standard = {}
+    for alt_num in api_alt_nums:
+        std_num = _standard_from_alt(alt_num)
+        if std_num in standard_set:
+            by_standard.setdefault(std_num, []).append(alt_num)
+
+    valid = set()
+    for std_num, alt_nums in by_standard.items():
+        seen_digests = _base_seen_digests(set_code, std_num)
+        for alt_num in sorted(alt_nums, key=_alt_sort_key):
+            if _download_unique_alt_digest(set_code, alt_num, seen_digests):
+                valid.add(alt_num)
+    return valid
+
+
+def find_missing_alt_arts(set_code, standard_numbers, existing_numbers, card_numbers=None):
+    found_from_api = set()
+
+    if card_numbers:
+        for cn in card_numbers:
+            if not is_alt_card(cn):
                 continue
-            alt_id = f"{set_code}-{alt_num}"
-            if check_image_exists_en(alt_id, set_code):
-                found.append(alt_num)
-            else:
-                break
-    return found
+            parts = cn.split("-", 1)
+            if len(parts) < 2:
+                continue
+            alt_num = parts[1]
+            if alt_num not in existing_numbers:
+                found_from_api.add(alt_num)
+
+    found = _validate_api_alt_arts(set_code, found_from_api, standard_numbers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [
+            executor.submit(
+                _check_std_num_alts,
+                (set_code, std_num, existing_numbers, found_from_api)
+            )
+            for std_num in standard_numbers
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            found.update(future.result())
+
+    return sorted(found)
 
 
 def _create_product(set_code, num, collection, card_type_id):
@@ -326,20 +422,133 @@ def _create_product(set_code, num, collection, card_type_id):
 
 def _try_register_image(product_id, card_id, set_code, lang_id,
                         image_file_type_id, files_path, img_path_pattern, card_type,
-                        try_download_fn, lang_suffix, existing_lang_ids, stats):
+                        try_download_fn, lang_suffix, existing_lang_ids):
     if lang_id and lang_id not in existing_lang_ids:
         ok = download_and_register_image(
             product_id, card_id, set_code, lang_id,
             image_file_type_id, files_path, img_path_pattern, card_type,
             try_download_fn, lang_suffix
         )
-        if ok:
-            stats["images_downloaded"] += 1
-            return "ok"
-        stats["images_skipped"] += 1
-        return "fail"
-    stats["images_skipped"] += 1
+        return "ok" if ok else "fail"
     return "skip"
+
+
+def _process_standard_card(params):
+    (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
+     image_file_type_id, files_path, img_path_pattern, card_type,
+     api_base, existing_nums, existing_images_by_product, stats) = params
+
+    search_result = fetch_json(
+        f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(f'{set_code}-{num}')}"
+    )
+    if not search_result or not isinstance(search_result, list) or not search_result:
+        return None
+
+    card_id = f"{set_code}-{num}"
+    product_id = _create_product(set_code, num, collection, card_type_id)
+    if not product_id:
+        return None
+
+    existing_lang_ids = existing_images_by_product.get(product_id, set())
+    en_st = _try_register_image(
+        product_id, card_id, set_code, en_lang_id,
+        image_file_type_id, files_path, img_path_pattern, card_type,
+        try_download_image_en, "en", existing_lang_ids
+    )
+    jp_st = _try_register_image(
+        product_id, card_id, set_code, jp_lang_id,
+        image_file_type_id, files_path, img_path_pattern, card_type,
+        try_download_image_jp, "jp", existing_lang_ids
+    )
+
+    with _stats_lock:
+        existing_nums.add(num)
+        stats["new_standard"] += 1
+        stats["images_downloaded"] += (1 if en_st == "ok" else 0) + (1 if jp_st == "ok" else 0)
+        stats["images_skipped"] += (1 if en_st != "ok" else 0) + (1 if jp_st != "ok" else 0)
+
+    return f"    + {card_id:<26} created (id={product_id}) en={en_st} jp={jp_st}"
+
+
+def _process_jp_image(params):
+    (set_code, num, product_id, jp_lang_id, image_file_type_id,
+     files_path, img_path_pattern, card_type, existing_images_by_product, stats) = params
+
+    existing_lang_ids = existing_images_by_product.get(product_id, set())
+    if not jp_lang_id or jp_lang_id in existing_lang_ids:
+        return None
+
+    card_id = f"{set_code}-{num}"
+    jp_st = _try_register_image(
+        product_id, card_id, set_code, jp_lang_id,
+        image_file_type_id, files_path, img_path_pattern, card_type,
+        try_download_image_jp, "jp", existing_lang_ids
+    )
+
+    with _stats_lock:
+        existing_images_by_product.setdefault(product_id, set()).add(jp_lang_id)
+        if jp_st == "ok":
+            stats["images_downloaded"] += 1
+            stats["jp_images_added"] += 1
+        else:
+            stats["images_skipped"] += 1
+
+    return f"    ~ {card_id:<26} existing (id={product_id}) jp={jp_st}"
+
+
+def _process_alt_art(params):
+    (set_code, alt_num, collection, card_type_id, en_lang_id, jp_lang_id,
+     image_file_type_id, files_path, img_path_pattern, card_type,
+     existing_nums, existing_images_by_product, stats) = params
+
+    card_id = f"{set_code}-{alt_num}"
+    results = []
+
+    en_pid = _create_product(set_code, alt_num, collection, card_type_id)
+    if en_pid:
+        with _stats_lock:
+            existing_nums.add(alt_num)
+            stats["alt_arts_created"] += 1
+
+        existing_lang_ids = existing_images_by_product.get(en_pid, set())
+        en_st = _try_register_image(
+            en_pid, card_id, set_code, en_lang_id,
+            image_file_type_id, files_path, img_path_pattern, card_type,
+            try_download_image_en, "en", existing_lang_ids
+        )
+
+        with _stats_lock:
+            if en_st == "ok":
+                stats["images_downloaded"] += 1
+            else:
+                stats["images_skipped"] += 1
+
+        results.append(f"    + {card_id:<26} created (id={en_pid}) en={en_st}")
+
+        if jp_lang_id:
+            jp_num = f"{alt_num}JP"
+            if jp_num not in existing_nums and check_image_exists_jp(card_id):
+                jp_pid = _create_product(set_code, jp_num, collection, card_type_id)
+                if jp_pid:
+                    with _stats_lock:
+                        existing_nums.add(jp_num)
+                        stats["alt_arts_created"] += 1
+
+                    ok = download_and_register_image(
+                        jp_pid, card_id, set_code, jp_lang_id,
+                        image_file_type_id, files_path, img_path_pattern, card_type,
+                        try_download_image_jp, "jp"
+                    )
+
+                    with _stats_lock:
+                        stats["images_downloaded"] += 1 if ok else 0
+                        stats["images_skipped"] += 0 if ok else 1
+
+                    results.append(f"    + {card_id:<26}JP created (id={jp_pid}) jp={'ok' if ok else 'fail'}")
+    else:
+        results.append(f"    ! {card_id:<26} EN failed to create")
+
+    return "\n".join(results)
 
 
 def sync():
@@ -474,62 +683,40 @@ def sync():
             if is_standard_card(cn)
         })
 
-        new_for_set = 0
-        for num in standard_nums:
-            if num in existing_nums:
-                stats["existing_standard"] += 1
-                continue
+        new_cards = [num for num in standard_nums if num not in existing_nums]
+        stats["existing_standard"] += len(standard_nums) - len(new_cards)
 
-            search_result = fetch_json(
-                f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(f'{set_code}-{num}')}"
-            )
-            if not search_result or not isinstance(search_result, list) or not search_result:
-                continue
+        if new_cards:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {
+                    executor.submit(
+                        _process_standard_card,
+                        (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
+                         image_file_type_id, files_path, img_path_pattern, card_type,
+                         api_base, existing_nums, existing_images_by_product, stats)
+                    ): num
+                    for num in new_cards
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    msg = future.result()
+                    if msg:
+                        print(msg)
 
-            card_id = f"{set_code}-{num}"
-
-            product_id = _create_product(set_code, num, collection, card_type_id)
-            if not product_id:
-                print(f"    ! {card_id:<26} failed to create")
-                stats["errors"] += 1
-                continue
-
-            print(f"    + {card_id:<26} created (id={product_id})", end="", flush=True)
-            existing_nums.add(num)
-            new_for_set += 1
-
-            existing_lang_ids = existing_images_by_product.get(product_id, set())
-
-            en_st = _try_register_image(
-                product_id, card_id, set_code, en_lang_id,
-                image_file_type_id, files_path, img_path_pattern, card_type,
-                try_download_image_en, "en", existing_lang_ids, stats
-            )
-            jp_st = _try_register_image(
-                product_id, card_id, set_code, jp_lang_id,
-                image_file_type_id, files_path, img_path_pattern, card_type,
-                try_download_image_jp, "jp", existing_lang_ids, stats
-            )
-            print(f" en={en_st} jp={jp_st}")
-
-            time.sleep(0.1)
-
-        if new_for_set:
-            print(f"  {set_code}: +{new_for_set} new standard cards")
-        stats["new_standard"] += new_for_set
+            created = sum(1 for num in new_cards if num in existing_nums)
+            if created:
+                print(f"  {set_code}: +{created} new standard cards")
 
     # ── Phase 1.5: Add JP images to existing standard products ──
     print(f"\n{'=' * 58}")
     print(f"  Phase 1.5: Add JP images to existing standard products")
     print(f"{'=' * 58}")
 
-    jp_added_count = 0
+    jp_candidates = []
     for set_code in all_set_codes:
         if set_code not in known_collections:
             continue
 
         existing_nums = existing_by_collection.get(set_code, set())
-
         standard_nums = sorted({
             get_standard_number(cn)
             for cn in groups[set_code]
@@ -539,34 +726,33 @@ def sync():
         for num in standard_nums:
             if num not in existing_nums:
                 continue
-
             product_id = existing_product_map.get((set_code, num))
             if not product_id:
                 continue
-
             existing_lang_ids = existing_images_by_product.get(product_id, set())
             if not jp_lang_id or jp_lang_id in existing_lang_ids:
                 continue
+            jp_candidates.append((set_code, num, product_id))
 
-            card_id = f"{set_code}-{num}"
-            print(f"    ~ {card_id:<26} existing (id={product_id})", end="", flush=True)
+    if jp_candidates:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(
+                    _process_jp_image,
+                    (set_code, num, product_id, jp_lang_id, image_file_type_id,
+                     files_path, img_path_pattern, card_type, existing_images_by_product, stats)
+                ): (set_code, num)
+                for set_code, num, product_id in jp_candidates
+            }
+            for future in concurrent.futures.as_completed(futures):
+                msg = future.result()
+                if msg:
+                    print(msg)
 
-            jp_st = _try_register_image(
-                product_id, card_id, set_code, jp_lang_id,
-                image_file_type_id, files_path, img_path_pattern, card_type,
-                try_download_image_jp, "jp", existing_lang_ids, stats
-            )
-            existing_images_by_product.setdefault(product_id, set()).add(jp_lang_id)
-            print(f" jp={jp_st}")
-
-            if jp_st == "ok":
-                jp_added_count += 1
-
-            time.sleep(0.1)
-
-    if jp_added_count:
-        print(f"\n  JP images added to {jp_added_count} existing products")
-    stats["jp_images_added"] += jp_added_count
+    with _stats_lock:
+        added = stats["jp_images_added"]
+    if added:
+        print(f"\n  JP images added to {added} existing products")
 
     # ── Phase 2: Detect and create alt arts + download images ──
     print(f"\n{'=' * 58}")
@@ -587,62 +773,84 @@ def sync():
             if is_standard_card(cn)
         })
 
-        alt_nums = find_missing_alt_arts(set_code, standard_nums, existing_nums)
+        alt_nums = find_missing_alt_arts(set_code, standard_nums, existing_nums, card_numbers)
         total_alts = len(alt_nums)
-        new_alts = 0
-        for idx, alt_num in enumerate(alt_nums, 1):
-            if idx % 10 == 0 or idx == total_alts:
-                print(f"  {set_code}: alt art {idx}/{total_alts}")
 
-            card_id = f"{set_code}-{alt_num}"
+        if alt_nums:
+            print(f"  {set_code}: processing {total_alts} alt arts...")
 
-            # EN product + image
-            en_pid = _create_product(set_code, alt_num, collection, card_type_id)
-            if en_pid:
-                print(f"    + {card_id:<26} created (id={en_pid})", end="", flush=True)
-                existing_nums.add(alt_num)
-                new_alts += 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {
+                    executor.submit(
+                        _process_alt_art,
+                        (set_code, alt_num, collection, card_type_id, en_lang_id, jp_lang_id,
+                         image_file_type_id, files_path, img_path_pattern, card_type,
+                         existing_nums, existing_images_by_product, stats)
+                    ): alt_num
+                    for alt_num in alt_nums
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    msg = future.result()
+                    if msg:
+                        print(msg)
 
-                existing_lang_ids = existing_images_by_product.get(en_pid, set())
-                en_st = _try_register_image(
-                    en_pid, card_id, set_code, en_lang_id,
-                    image_file_type_id, files_path, img_path_pattern, card_type,
-                    try_download_image_en, "en", existing_lang_ids, stats
-                )
-                print(f" en={en_st}")
-            else:
-                print(f"    ! {card_id:<26} EN failed to create")
-                stats["errors"] += 1
+            created = sum(1 for alt_num in alt_nums if alt_num in existing_nums)
+            if created:
+                print(f"  {set_code}: +{created} alt arts")
 
-            # JP product + image (separate product with JP suffix)
-            if jp_lang_id:
-                jp_num = f"{alt_num}JP"
-                if jp_num not in existing_nums and check_image_exists_jp(card_id):
-                    jp_pid = _create_product(set_code, jp_num, collection, card_type_id)
-                    if jp_pid:
-                        print(f"    + {card_id:<26}JP created (id={jp_pid})", end="", flush=True)
-                        existing_nums.add(jp_num)
+    # ── Phase 3: Fill gaps in standard card numbering ──
+    print(f"\n{'=' * 58}")
+    print(f"  Phase 3: Fill gaps in standard card numbering (1..max)")
+    print(f"{'=' * 58}")
 
-                        ok = download_and_register_image(
-                            jp_pid, card_id, set_code, jp_lang_id,
-                            image_file_type_id, files_path, img_path_pattern, card_type,
-                            try_download_image_jp, "jp"
-                        )
-                        if ok:
-                            stats["images_downloaded"] += 1
-                            print(f" jp=ok")
-                        else:
-                            stats["images_skipped"] += 1
-                            print(f" jp=fail")
-                    else:
-                        print(f"    ! {card_id:<26}JP failed to create")
-                        stats["errors"] += 1
+    for set_code in all_set_codes:
+        if set_code not in known_collections:
+            continue
 
-            time.sleep(0.1)
+        card_numbers = groups[set_code]
+        existing_nums = existing_by_collection.get(set_code, set())
+        collection = digimon_collections[set_code]
 
-        if new_alts:
-            print(f"  {set_code}: +{new_alts} alt arts")
-        stats["alt_arts_created"] += new_alts
+        standard_nums = sorted({
+            get_standard_number(cn)
+            for cn in card_numbers
+            if is_standard_card(cn)
+        })
+        if not standard_nums:
+            continue
+
+        int_nums = [int(n) for n in standard_nums]
+        max_num = max(int_nums)
+        pad = len(standard_nums[0])
+
+        missing = []
+        for i in range(1, max_num + 1):
+            padded = str(i).zfill(pad)
+            if padded not in existing_nums:
+                missing.append(padded)
+
+        if not missing:
+            continue
+
+        print(f"  {set_code}: checking {len(missing)} gaps in range 1..{max_num}...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(
+                    _process_standard_card,
+                    (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
+                     image_file_type_id, files_path, img_path_pattern, card_type,
+                     api_base, existing_nums, existing_images_by_product, stats)
+                ): num
+                for num in missing
+            }
+            for future in concurrent.futures.as_completed(futures):
+                msg = future.result()
+                if msg:
+                    print(msg)
+
+        filled = sum(1 for num in missing if num in existing_nums)
+        if filled:
+            print(f"  {set_code}: +{filled} gaps filled")
 
     print(f"\n{SEP}")
     print(f"  New standard:       {stats['new_standard']}")

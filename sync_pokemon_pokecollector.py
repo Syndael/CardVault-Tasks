@@ -582,6 +582,118 @@ async def main():
             api_request("PATCH", f"collections/{col_id}", {"force_download": False})
             print(f"\n  Coleccion {col_name} marcada como descargada\n")
 
+        # ── Post-processing: fix missing images ──
+        print(f"\n{'='*70}")
+        print(f"  Fixing products missing images in pokecollector collections...")
+        print(f"{'='*70}")
+
+        fix_stats = {"checked": 0, "img_ok": 0, "img_fail": 0}
+
+        all_cols = api_get_all("collections", {"per_page": 500})
+        cols_with_url = [c for c in all_cols if c.get("force_url")]
+
+        for col in cols_with_url:
+            col_code = col["code"]
+            col_name = col["name"]
+            col_url = col["force_url"]
+
+            products = api_get_all("product-catalog", {
+                "collection_code": col_code,
+                "product_type_id": card_type_id,
+                "per_page": 200
+            })
+            if not products:
+                continue
+
+            missing = []
+            for p in products:
+                pid = p.get("product_id") or p.get("id")
+                if not pid:
+                    continue
+                files = api_get("files", {"product_id": pid, "per_page": 1})
+                has = files and isinstance(files, dict) and files.get("items") and len(files["items"]) > 0
+                if not has:
+                    missing.append(p)
+
+            if not missing:
+                continue
+
+            fix_stats["checked"] += len(missing)
+            print(f"\n  {col_name} ({col_code}): {len(missing)} products missing images")
+
+            cards_data = await scrape_collection_cards(page, col_url)
+            if not cards_data:
+                print(f"    Error scraping collection page, skipping")
+                continue
+
+            card_map = {c["number"]: c for c in cards_data}
+
+            for p in missing:
+                num = p.get("product_number")
+                pid = p.get("product_id") or p.get("id")
+                if num not in card_map:
+                    print(f"    Card #{num}: URL not found, skipping")
+                    continue
+
+                card_info = card_map[num]
+                print(f"\n    [#{num}] {card_info['en_name_guess']}")
+                print(f"    URL: {card_info['url']}")
+
+                card_scrape = await scrape_card_page(page, card_info["url"])
+                if not card_scrape or not card_scrape["image_url"]:
+                    print(f"    No image URL found")
+                    continue
+
+                image_url = card_scrape["image_url"]
+                print(f"    Img: {image_url}")
+
+                image_data = download_file(image_url)
+                if not image_data:
+                    fix_stats["img_fail"] += 1
+                    print(f"    Error downloading image")
+                    continue
+
+                ext = os.path.splitext(image_url.split("/")[-1])[1] or ".png"
+                original_name = image_url.split("/")[-1]
+                stored_name = f"{col_code}_{num}_ja{ext}"
+                is_manual_val = "1"
+                pattern = (img_path_pattern or "").replace("collection_code}", "{collection_code}")
+                sub_dir = pattern.replace("{card_type}", card_type_short).replace("{is_manual}", is_manual_val).replace("{collection_code}", col_code) if pattern else f"{card_type_short}/{is_manual_val}/{col_code}"
+                base_dir = files_path if os.path.isabs(files_path) else os.path.join(_API_ROOT, files_path)
+                target_dir = os.path.join(base_dir, sub_dir)
+                os.makedirs(target_dir, exist_ok=True)
+
+                local_rel = os.path.join(files_path, sub_dir, stored_name)
+                local_abs = os.path.join(base_dir, sub_dir, stored_name)
+                with open(local_abs, "wb") as f:
+                    f.write(image_data)
+                file_size = len(image_data)
+
+                try:
+                    api_request("POST", "files", {
+                        "product_id": pid,
+                        "language_id": lang_ja_id,
+                        "file_type_id": image_file_type_id,
+                        "original_name": original_name,
+                        "stored_name": stored_name,
+                        "file_path": local_rel,
+                        "file_size": file_size,
+                    })
+                    fix_stats["img_ok"] += 1
+                    print(f"    Image saved: {stored_name} ({file_size} bytes)")
+                except Exception as e:
+                    fix_stats["img_fail"] += 1
+                    print(f"    Error saving image: {e}")
+
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+        if fix_stats["checked"]:
+            print(f"\n  Missing images fix:")
+            print(f"    Products checked: {fix_stats['checked']}")
+            print(f"    Images downloaded: {fix_stats['img_ok']}")
+            if fix_stats["img_fail"]:
+                print(f"    Images failed: {fix_stats['img_fail']}")
+
         await context.close()
 
     print(f"\n  {SEP}")
