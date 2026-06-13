@@ -208,7 +208,7 @@ def run_execution(execution):
         result = subprocess.run(
             [sys.executable, script_path],
             capture_output=True, text=True, timeout=TASK_TIMEOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "CARDVAULT_TASK_EXECUTION_ID": str(exec_id)},
         )
         output = result.stdout
         if result.stderr:

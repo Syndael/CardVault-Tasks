@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+from task_logger import TaskLogger, finalize_log
+
 import json
 import os
 import sys
@@ -10,6 +13,13 @@ import urllib.request
 
 
 load_dotenv()
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+_API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
+
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
 API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
@@ -17,6 +27,7 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 PARAM_KEY_API_BASE = "sync.pokemon.collections.api.base"
 PARAM_KEY_CAR_TYPE = "sync.pokemon.collections.card.type"
 PARAM_KEY_MIG_LANG = "sync.pokemon.collections.migration.languages"
+PARAM_KEY_LOG_PATH = "tasks.log.path"
 SEP = "=" * 58
 
 _token: str | None = None
@@ -168,7 +179,7 @@ def get_param(settings_by_key, param_key):
     if param is None:
         raise RuntimeError(f"setting '{param_key}' not found")
 
-    print(f"  {param_key}: {param}")
+    (_logger or print)(f"  {param_key}: {param}")
     return param
 
 
@@ -254,6 +265,8 @@ def upsert_translation(existing_translation, collection_id, lang_id, name):
 
 
 def sync():
+    global _logger
+
     print(f"\n{SEP}")
     print("  Searching Pokemon sets via CardVault API")
     print(SEP)
@@ -269,8 +282,12 @@ def sync():
     card_type = get_param(settings_by_key, PARAM_KEY_CAR_TYPE)
     migration_languages = get_param(settings_by_key, PARAM_KEY_MIG_LANG)
     api_lang, db_lang = parse_migration_languages(migration_languages)
+    log_path_setting = get_param(settings_by_key, PARAM_KEY_LOG_PATH)
 
-    print("\n  Getting local API data...")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "pokemon_collections")
+
+    _logger.log("\n  Getting local API data...")
     types = api_get_all("types")
     languages = api_get_all("languages")
     collections = api_get_all("collections")
@@ -291,9 +308,9 @@ def sync():
         collection_ids
     )
 
-    print("\n  Getting sets...")
+    _logger.log("\n  Getting sets...")
     all_sets = get_tcgdex_sets(api_base)
-    print(f"  {len(all_sets)} sets\n")
+    _logger.log(f"  {len(all_sets)} sets\n")
 
     if not all_sets:
         sys.exit(1)
@@ -308,12 +325,7 @@ def sync():
     for i, item in enumerate(all_sets):
         set_id = item["id"]
         en_name = item.get("name", "")
-        print(
-            f"  [{i + 1:>4}/{len(all_sets)}] "
-            f"{set_id:<20} {en_name:<35}",
-            end="",
-            flush=True
-        )
+        line = f"  [{i + 1:>4}/{len(all_sets)}] {set_id:<20} {en_name:<35}"
 
         collection = collections_by_code.get(set_id)
         if collection:
@@ -379,14 +391,17 @@ def sync():
             else:
                 stats["updated_trans"] += 1
 
-        print(f" [{tag}] trans({','.join(translations_added) or '-'})")
+        line += f" [{tag}] trans({','.join(translations_added) or '-'})"
+        _logger.log(line)
 
-    print(f"\n{SEP}")
-    print(f"  New cols:       {stats['new_cols']}")
-    print(f"  Existing cols:  {stats['existing_cols']}")
-    print(f"  New trans:      {stats['new_trans']}")
-    print(f"  Updated trans:  {stats['updated_trans']}")
-    print(SEP + "\n")
+    _logger.log(f"\n{SEP}")
+    _logger.log(f"  New cols:       {stats['new_cols']}")
+    _logger.log(f"  Existing cols:  {stats['existing_cols']}")
+    _logger.log(f"  New trans:      {stats['new_trans']}")
+    _logger.log(f"  Updated trans:  {stats['updated_trans']}")
+    _logger.log(SEP + "\n")
+
+    finalize_log(_logger, "pokemon_collections", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

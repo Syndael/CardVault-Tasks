@@ -10,12 +10,15 @@ import urllib.request
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+from task_logger import TaskLogger, finalize_log
 
 load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -98,10 +101,10 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        print(f"\n  [API {e.code}] {method} {path}: {e}")
+        (_logger or print)(f"\n  [API {e.code}] {method} {path}")
         return None
     except Exception as e:
-        print(f"\n  [API error] {method} {path}: {e}")
+        (_logger or print)(f"\n  [API error] {method} {path}: {e}")
         return None
 
 
@@ -265,6 +268,8 @@ def parse_args():
 
 
 def main():
+    global _logger
+
     args = parse_args()
 
     if not API_BASE or not API_USERNAME or not API_PASSWORD:
@@ -284,38 +289,47 @@ def main():
 
     print("  Fetching settings...")
     settings = api_get_all("settings")
+    settings_by_key = {s["setting_key"]: s.get("setting_value") for s in settings}
+    log_path_setting = settings_by_key.get("tasks.log.path", "./logs")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "clean_orphan_images")
+    _logger.log(f"  Mode: {'DELETE' if args.delete else 'dry-run'}")
+    _logger.log(f"  Log path: {log_dir}")
+
     roots_by_label = get_product_image_roots(settings, args.path)
     roots = sorted(roots_by_label)
 
     if not roots:
-        print("  No product image roots found in settings.")
-        print("  Use --path /path/to/products_images to scan a directory manually.")
+        _logger.log("  No product image roots found in settings.")
+        _logger.log("  Use --path /path/to/products_images to scan a directory manually.")
+        finalize_log(_logger, "clean_orphan_images", _API_ROOT, api_request)
         sys.exit(1)
 
-    print("  Product image roots:")
+    _logger.log("  Product image roots:")
     existing_roots = []
     for root in roots:
         exists = os.path.isdir(root)
         labels = ", ".join(sorted(roots_by_label[root]))
-        print(f"    {root} ({labels}) {'OK' if exists else 'missing'}")
+        _logger.log(f"    {root} ({labels}) {'OK' if exists else 'missing'}")
         if exists:
             existing_roots.append(root)
 
     if not existing_roots:
-        print("\n  No existing directories to scan.")
+        _logger.log("\n  No existing directories to scan.")
+        finalize_log(_logger, "clean_orphan_images", _API_ROOT, api_request)
         return
 
-    print("\n  Fetching files from API...")
+    _logger.log("\n  Fetching files from API...")
     files = api_get_all("files", {"per_page": 500})
     referenced, missing, remote, outside = get_referenced_paths(files, existing_roots)
-    print(f"  API file rows: {len(files)}")
-    print(f"  Referenced local files in scanned roots: {len(referenced)}")
+    _logger.log(f"  API file rows: {len(files)}")
+    _logger.log(f"  Referenced local files in scanned roots: {len(referenced)}")
     if missing:
-        print(f"  Rows without usable file_path: {missing}")
+        _logger.log(f"  Rows without usable file_path: {missing}")
     if remote:
-        print(f"  Remote file_path rows skipped: {remote}")
+        _logger.log(f"  Remote file_path rows skipped: {remote}")
     if outside:
-        print(f"  Rows outside scanned roots skipped: {outside}")
+        _logger.log(f"  Rows outside scanned roots skipped: {outside}")
 
     orphan_files = []
     total_files = 0
@@ -326,8 +340,8 @@ def main():
                 orphan_files.append(local_path)
 
     orphan_files.sort()
-    print(f"\n  Local files scanned: {total_files}")
-    print(f"  Orphan files found: {len(orphan_files)}")
+    _logger.log(f"\n  Local files scanned: {total_files}")
+    _logger.log(f"  Orphan files found: {len(orphan_files)}")
 
     deleted = 0
     failed = 0
@@ -346,16 +360,16 @@ def main():
             try:
                 os.remove(path)
                 deleted += 1
-                print(f"    deleted {rel}")
+                _logger.log(f"    deleted {rel}")
             except OSError as e:
                 failed += 1
-                print(f"    failed  {rel}: {e}")
+                _logger.log(f"    failed  {rel}: {e}")
         else:
-            print(f"    orphan  {rel}")
+            _logger.log(f"    orphan  {rel}")
 
     hidden = len(orphan_files) - len(printable_orphans)
     if hidden > 0:
-        print(f"    ... {hidden} more orphan files hidden. Use --verbose to list all.")
+        _logger.log(f"    ... {hidden} more orphan files hidden. Use --verbose to list all.")
 
     if args.delete and len(printable_orphans) < len(orphan_files):
         for path in orphan_files[len(printable_orphans):]:
@@ -370,16 +384,17 @@ def main():
         for root in existing_roots:
             empty_dirs += prune_empty_dirs(root, args.delete)
 
-    print(f"\n  {SEP}")
-    print(f"  Orphans:      {len(orphan_files)}")
-    print(f"  Deleted:      {deleted}")
-    print(f"  Failed:       {failed}")
+    _logger.log(f"\n  {SEP}")
+    _logger.log(f"  Orphans:      {len(orphan_files)}")
+    _logger.log(f"  Deleted:      {deleted}")
+    _logger.log(f"  Failed:       {failed}")
     if args.prune_empty_dirs:
         label = "Removed dirs" if args.delete else "Empty dirs"
-        print(f"  {label}:   {empty_dirs}")
+        _logger.log(f"  {label}:   {empty_dirs}")
     if not args.delete and orphan_files:
-        print("  Dry-run only. Re-run with --delete to remove these files.")
-    print(f"  {SEP}\n")
+        _logger.log("  Dry-run only. Re-run with --delete to remove these files.")
+    _logger.log(f"  {SEP}\n")
+    finalize_log(_logger, "clean_orphan_images", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

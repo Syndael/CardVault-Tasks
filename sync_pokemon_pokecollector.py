@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from task_logger import TaskLogger, finalize_log
 
 try:
     from playwright.async_api import async_playwright
@@ -27,6 +28,8 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 
+_logger: TaskLogger | None = None
+
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
 API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
@@ -34,6 +37,7 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 SETTING_CARD_TYPE = "sync.pokemon.products.card.type"
 SETTING_IMG_PATH = "sync.pokemon.products.img.path"
 SETTING_IMG_PATH_PATTERN = "sync.pokemon.products.img.path.pattern"
+SETTING_LOG_PATH = "tasks.log.path"
 
 DELAY_MIN = 2.0
 DELAY_MAX = 5.0
@@ -102,10 +106,10 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        print(f"    API {method} {path} -> HTTP {e.code}: {err_body[:300]}")
+        (_logger or print)(f"    API {method} {path} -> HTTP {e.code}: {err_body[:300]}")
         return None
     except Exception as ex:
-        print(f"    API {method} {path} -> ERROR: {ex}")
+        (_logger or print)(f"    API {method} {path} -> ERROR: {ex}")
         return None
 
 
@@ -290,6 +294,8 @@ async def scrape_card_page(page, url):
 
 
 async def main():
+    global _logger
+
     if not API_BASE or not API_USERNAME or not API_PASSWORD:
         print("Faltan CARDVAULT_API_* env vars")
         sys.exit(1)
@@ -317,8 +323,15 @@ async def main():
         print(f"  Files path (default): {files_path}")
 
     print(f"  Img path pattern: {img_path_pattern}")
+    log_path_setting = settings_by_key.get(SETTING_LOG_PATH, "./logs")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "pokemon_pokecollector")
+    _logger.log(f"  Log path: {log_dir}")
+    _logger.log(f"  Card type: {card_type_short}")
+    _logger.log(f"  Files path: {files_path}")
+    _logger.log(f"  Img path pattern: {img_path_pattern}")
 
-    print("\nObteniendo tipos...")
+    _logger.log("\nObteniendo tipos...")
     types_list = api_get_all("types")
     card_type_id = None
     image_file_type_id = None
@@ -328,15 +341,17 @@ async def main():
         if t.get("type") == "file" and t.get("name") == "image":
             image_file_type_id = t["id"]
     if not card_type_id:
-        print(f"  ERROR: card type '{card_type_short}' no encontrado en types")
+        _logger.log(f"  ERROR: card type '{card_type_short}' no encontrado en types")
+        finalize_log(_logger, "pokemon_pokecollector", _API_ROOT, api_request)
         sys.exit(1)
     if not image_file_type_id:
-        print("  ERROR: file type 'image' no encontrado")
+        _logger.log("  ERROR: file type 'image' no encontrado")
+        finalize_log(_logger, "pokemon_pokecollector", _API_ROOT, api_request)
         sys.exit(1)
-    print(f"  Card type ID: {card_type_id}")
-    print(f"  Image file type ID: {image_file_type_id}")
+    _logger.log(f"  Card type ID: {card_type_id}")
+    _logger.log(f"  Image file type ID: {image_file_type_id}")
 
-    print("\nObteniendo idiomas...")
+    _logger.log("\nObteniendo idiomas...")
     languages_list = api_get_all("languages")
     lang_en_id = None
     lang_ja_id = None
@@ -345,17 +360,17 @@ async def main():
             lang_en_id = l["id"]
         if l.get("name") == "Japonés":
             lang_ja_id = l["id"]
-    print(f"  English ID: {lang_en_id}")
-    print(f"  Japanese ID: {lang_ja_id}")
+    _logger.log(f"  English ID: {lang_en_id}")
+    _logger.log(f"  Japanese ID: {lang_ja_id}")
 
-    print(f"\nObteniendo colecciones con force_url y force_download...")
+    _logger.log(f"\nObteniendo colecciones con force_url y force_download...")
     collections = api_get_all("collections", {"force_download": 1, "per_page": 200})
-    # Filter client-side: only those with force_url not null/empty
     target_collections = [c for c in collections if c.get("force_url")]
-    print(f"  {len(target_collections)} colecciones para procesar\n")
+    _logger.log(f"  {len(target_collections)} colecciones para procesar\n")
 
     if not target_collections:
-        print("No hay colecciones pendientes. Asigna force_url y force_download=true a una coleccion.\n")
+        _logger.log("No hay colecciones pendientes. Asigna force_url y force_download=true a una coleccion.\n")
+        finalize_log(_logger, "pokemon_pokecollector", _API_ROOT, api_request)
         return
 
     profile_dir, exe_path = find_browser_profile()
@@ -407,28 +422,28 @@ async def main():
             col_url = col["force_url"]
             stats["collections"] += 1
 
-            print(f"\n{'='*70}")
-            print(f"  Coleccion: {col_name} ({col_code})")
-            print(f"  URL: {col_url}")
-            print(f"{'='*70}")
+            _logger.log(f"\n{'='*70}")
+            _logger.log(f"  Coleccion: {col_name} ({col_code})")
+            _logger.log(f"  URL: {col_url}")
+            _logger.log(f"{'='*70}")
 
             cards_data = await scrape_collection_cards(page, col_url)
             if cards_data is None:
-                print("  Error obteniendo lista de cartas, saltando coleccion")
+                _logger.log("  Error obteniendo lista de cartas, saltando coleccion")
                 stats["errors"] += 1
                 continue
 
-            print(f"  Cartas encontradas: {len(cards_data)}")
+            _logger.log(f"  Cartas encontradas: {len(cards_data)}")
 
-            print("  Pre-calentando API (evita cold-start)...")
+            _logger.log("  Pre-calentando API (evita cold-start)...")
             api_get("product-catalog", {"per_page": 1, "collection_code": col_code})
 
             total = len(cards_data)
             for idx, card_info in enumerate(cards_data, 1):
                 card_num = card_info["number"]
                 en_name_guess = card_info["en_name_guess"]
-                print(f"\n  [{idx}/{total}] Card #{card_num} ({en_name_guess})")
-                print(f"    URL: {card_info['url']}")
+                _logger.log(f"\n  [{idx}/{total}] Card #{card_num} ({en_name_guess})")
+                _logger.log(f"    URL: {card_info['url']}")
 
                 # Check if product already exists — evita abrir el navegador
                 try:
@@ -451,22 +466,22 @@ async def main():
                 if existing_items:
                     stats["existed"] += 1
                     product_id = existing_items[0]["product_id"]
-                    print(f"    Producto existente: id={product_id}, saltando")
+                    _logger.log(f"    Producto existente: id={product_id}, saltando")
                     continue
 
                 # Solo abrimos la web si es producto nuevo
                 card_scrape = await scrape_card_page(page, card_info["url"])
                 if card_scrape is None:
-                    print("    Error scaneando carta, saltando")
+                    _logger.log("    Error scaneando carta, saltando")
                     stats["errors"] += 1
                     continue
 
                 en_name = card_scrape["en_name"]
                 jp_name = card_scrape["jp_name"]
                 image_url = card_scrape["image_url"]
-                print(f"    EN: {en_name}")
-                print(f"    JP: {jp_name or '—'}")
-                print(f"    Img: {image_url or '—'}")
+                _logger.log(f"    EN: {en_name}")
+                _logger.log(f"    JP: {jp_name or '—'}")
+                _logger.log(f"    Img: {image_url or '—'}")
 
                 stats["cards"] += 1
 
@@ -483,12 +498,12 @@ async def main():
                         if result and result.get("id"):
                             product_id = result["id"]
                             stats["created"] += 1
-                            print(f"    Producto creado: id={product_id}")
+                            _logger.log(f"    Producto creado: id={product_id}")
                             created = True
                             break
-                        print(f"    Error creando producto (intento {attempt + 1})")
+                        _logger.log(f"    Error creando producto (intento {attempt + 1})")
                     except Exception as e:
-                        print(f"    Error creando producto: {e} (intento {attempt + 1})")
+                        _logger.log(f"    Error creando producto: {e} (intento {attempt + 1})")
                     if attempt < 2:
                         await asyncio.sleep(1)
                 if not created:
@@ -515,7 +530,7 @@ async def main():
                             })
                         stats["trans_ok"] += 1
                     except Exception as e:
-                        print(f"    Error creando traduccion JP: {e}")
+                        _logger.log(f"    Error creando traduccion JP: {e}")
 
                 if en_name:
                     try:
@@ -564,28 +579,28 @@ async def main():
                                 "file_size": file_size,
                             })
                             stats["img_ok"] += 1
-                            print(f"    Imagen guardada: {stored_name} ({file_size} bytes)")
+                            _logger.log(f"    Imagen guardada: {stored_name} ({file_size} bytes)")
                         except Exception as e:
                             stats["img_fail"] += 1
-                            print(f"    Error guardando imagen: {e}")
+                            _logger.log(f"    Error guardando imagen: {e}")
                     else:
                         stats["img_fail"] += 1
-                        print(f"    Error descargando imagen")
+                        _logger.log(f"    Error descargando imagen")
 
                 api_request("PATCH", f"products/{product_id}", {"force_download": False})
 
                 if idx < total:
                     delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                    print(f"    Pausa {delay:.1f} s...")
+                    _logger.log(f"    Pausa {delay:.1f} s...")
                     await asyncio.sleep(delay)
 
             api_request("PATCH", f"collections/{col_id}", {"force_download": False})
-            print(f"\n  Coleccion {col_name} marcada como descargada\n")
+            _logger.log(f"\n  Coleccion {col_name} marcada como descargada\n")
 
         # ── Post-processing: fix missing images ──
-        print(f"\n{'='*70}")
-        print(f"  Fixing products missing images in pokecollector collections...")
-        print(f"{'='*70}")
+        _logger.log(f"\n{'='*70}")
+        _logger.log(f"  Fixing products missing images in pokecollector collections...")
+        _logger.log(f"{'='*70}")
 
         fix_stats = {"checked": 0, "img_ok": 0, "img_fail": 0}
 
@@ -619,11 +634,11 @@ async def main():
                 continue
 
             fix_stats["checked"] += len(missing)
-            print(f"\n  {col_name} ({col_code}): {len(missing)} products missing images")
+            _logger.log(f"\n  {col_name} ({col_code}): {len(missing)} products missing images")
 
             cards_data = await scrape_collection_cards(page, col_url)
             if not cards_data:
-                print(f"    Error scraping collection page, skipping")
+                _logger.log(f"    Error scraping collection page, skipping")
                 continue
 
             card_map = {c["number"]: c for c in cards_data}
@@ -632,25 +647,25 @@ async def main():
                 num = p.get("product_number")
                 pid = p.get("product_id") or p.get("id")
                 if num not in card_map:
-                    print(f"    Card #{num}: URL not found, skipping")
+                    _logger.log(f"    Card #{num}: URL not found, skipping")
                     continue
 
                 card_info = card_map[num]
-                print(f"\n    [#{num}] {card_info['en_name_guess']}")
-                print(f"    URL: {card_info['url']}")
+                _logger.log(f"\n    [#{num}] {card_info['en_name_guess']}")
+                _logger.log(f"    URL: {card_info['url']}")
 
                 card_scrape = await scrape_card_page(page, card_info["url"])
                 if not card_scrape or not card_scrape["image_url"]:
-                    print(f"    No image URL found")
+                    _logger.log(f"    No image URL found")
                     continue
 
                 image_url = card_scrape["image_url"]
-                print(f"    Img: {image_url}")
+                _logger.log(f"    Img: {image_url}")
 
                 image_data = download_file(image_url)
                 if not image_data:
                     fix_stats["img_fail"] += 1
-                    print(f"    Error downloading image")
+                    _logger.log(f"    Error downloading image")
                     continue
 
                 ext = os.path.splitext(image_url.split("/")[-1])[1] or ".png"
@@ -680,34 +695,35 @@ async def main():
                         "file_size": file_size,
                     })
                     fix_stats["img_ok"] += 1
-                    print(f"    Image saved: {stored_name} ({file_size} bytes)")
+                    _logger.log(f"    Image saved: {stored_name} ({file_size} bytes)")
                 except Exception as e:
                     fix_stats["img_fail"] += 1
-                    print(f"    Error saving image: {e}")
+                    _logger.log(f"    Error saving image: {e}")
 
                 await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
         if fix_stats["checked"]:
-            print(f"\n  Missing images fix:")
-            print(f"    Products checked: {fix_stats['checked']}")
-            print(f"    Images downloaded: {fix_stats['img_ok']}")
+            _logger.log(f"\n  Missing images fix:")
+            _logger.log(f"    Products checked: {fix_stats['checked']}")
+            _logger.log(f"    Images downloaded: {fix_stats['img_ok']}")
             if fix_stats["img_fail"]:
-                print(f"    Images failed: {fix_stats['img_fail']}")
+                _logger.log(f"    Images failed: {fix_stats['img_fail']}")
 
         await context.close()
 
-    print(f"\n  {SEP}")
-    print(f"  Colecciones:     {stats['collections']}")
-    print(f"  Cartas totales:  {stats['cards']}")
-    print(f"  Creadas:         {stats['created']}")
-    print(f"  Existentes:      {stats['existed']}")
-    print(f"  Traducciones JP: {stats['trans_ok']}")
-    print(f"  Imagenes OK:     {stats['img_ok']}")
+    _logger.log(f"\n  {SEP}")
+    _logger.log(f"  Colecciones:     {stats['collections']}")
+    _logger.log(f"  Cartas totales:  {stats['cards']}")
+    _logger.log(f"  Creadas:         {stats['created']}")
+    _logger.log(f"  Existentes:      {stats['existed']}")
+    _logger.log(f"  Traducciones JP: {stats['trans_ok']}")
+    _logger.log(f"  Imagenes OK:     {stats['img_ok']}")
     if stats["img_fail"]:
-        print(f"  Imagenes FAIL:   {stats['img_fail']}")
+        _logger.log(f"  Imagenes FAIL:   {stats['img_fail']}")
     if stats["errors"]:
-        print(f"  Errores:         {stats['errors']}")
-    print(f"  {SEP}\n")
+        _logger.log(f"  Errores:         {stats['errors']}")
+    _logger.log(f"  {SEP}\n")
+    finalize_log(_logger, "pokemon_pokecollector", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

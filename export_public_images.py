@@ -10,10 +10,17 @@ import urllib.request
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+from task_logger import TaskLogger, finalize_log
 
 load_dotenv()
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
+
 SETTING_KEY_PUBLIC_PATH = "export.public.images.path"
+SETTING_LOG_PATH = "tasks.log.path"
 TAG_CATEGORIES = ["album", "caja", "vitrina"]
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
@@ -212,6 +219,8 @@ def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None):
 
 
 def main():
+    global _logger
+
     if not API_BASE or not API_USERNAME or not API_PASSWORD:
         print("  Missing CARDVAULT_API_* env vars")
         sys.exit(1)
@@ -229,16 +238,21 @@ def main():
     print("  Fetching settings...")
     settings = api_get_all("settings")
     settings_by_key = {s["setting_key"]: s.get("setting_value") for s in settings}
+    log_path_setting = settings_by_key.get(SETTING_LOG_PATH, "./logs")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "export_public_images")
+    _logger.log(f"  API: {API_BASE}")
+    _logger.log(f"  Log path: {log_dir}")
+
     public_path = settings_by_key.get(SETTING_KEY_PUBLIC_PATH)
     if not public_path:
-        print(f"  ERROR: Setting '{SETTING_KEY_PUBLIC_PATH}' not found.")
-        print(f"  Create it via API: POST /api/settings/ with")
-        print(f"    setting_key='{SETTING_KEY_PUBLIC_PATH}'")
-        print(f"    setting_value='/path/to/CardVault-Web-Publica'")
+        _logger.log(f"  ERROR: Setting '{SETTING_KEY_PUBLIC_PATH}' not found.")
+        _logger.log(f"  Create it via API: POST /api/settings/ with setting_key='{SETTING_KEY_PUBLIC_PATH}' setting_value='/path/to/CardVault-Web-Publica'")
+        finalize_log(_logger, "export_public_images", _API_ROOT, api_request)
         sys.exit(1)
-    print(f"  Public path: {public_path}\n")
+    _logger.log(f"  Public path: {public_path}\n")
 
-    print("  Fetching tags...")
+    _logger.log("  Fetching tags...")
     all_tags = api_get_all("tags")
     matching_tags = {}
     for tag in all_tags:
@@ -249,12 +263,13 @@ def main():
                 break
 
     if not matching_tags:
-        print("  No tags found containing 'album', 'caja' or 'vitrina'")
+        _logger.log("  No tags found containing 'album', 'caja' or 'vitrina'")
+        finalize_log(_logger, "export_public_images", _API_ROOT, api_request)
         return
 
     for category, tags in matching_tags.items():
-        print(f"    {category}: {', '.join(t['name'] for t in tags)}")
-    print()
+        _logger.log(f"    {category}: {', '.join(t['name'] for t in tags)}")
+    _logger.log()
 
     seen_items = {}
     for category, tags in matching_tags.items():
@@ -263,8 +278,8 @@ def main():
             for item in items:
                 seen_items.setdefault(item["id"], item)
 
-    print(f"  Total unique inventory items to process: {len(seen_items)}")
-    print()
+    _logger.log(f"  Total unique inventory items to process: {len(seen_items)}")
+    _logger.log()
 
     sort_map = {}
     lang_map = {}
@@ -283,7 +298,7 @@ def main():
         condition = item.get("condition") or {}
         cond_map[str(inv_id)] = (condition.get("abbreviation") or "")[:5]
 
-    print("  Cleaning old-style duplicates and empty directories...")
+    _logger.log("  Cleaning old-style duplicates and empty directories...")
     root = os.path.abspath(public_path)
     for dirpath, dirnames, filenames in os.walk(root):
         for f in filenames:
@@ -333,7 +348,7 @@ def main():
             if old_type_name != card_type:
                 old_dir = os.path.join(public_path, category, old_type_name, section_name)
                 if os.path.isdir(old_dir):
-                    print(f"    Migrating {old_dir} → {target_dir}")
+                    _logger.log(f"    Migrating {old_dir} → {target_dir}")
                     for fname in os.listdir(old_dir):
                         shutil.move(os.path.join(old_dir, fname), os.path.join(target_dir, fname))
                     try:
@@ -371,14 +386,14 @@ def main():
 
                 data = download_file(file_url)
                 if data is None:
-                    print(f"    ERROR downloading inv file {file_id} for inv#{inv_id}")
+                    _logger.log(f"    ERROR downloading inv file {file_id} for inv#{inv_id}")
                     errors += 1
                     continue
 
                 with open(dest_path, "wb") as fh:
                     fh.write(data)
                 copied += 1
-                print(f"    [{category}/{section_name}] inv#{inv_id} file#{file_id} -> {dest_path}")
+                _logger.log(f"    [{category}/{section_name}] inv#{inv_id} file#{file_id} -> {dest_path}")
 
         product_image_url = item.get("product_image_url")
         if product_image_url:
@@ -414,21 +429,22 @@ def main():
                     with open(dest_path, "wb") as fh:
                         fh.write(data)
                     copied += 1
-                    print(f"    [{category}/{section_name}] inv#{inv_id} prod -> {dest_path}")
+                    _logger.log(f"    [{category}/{section_name}] inv#{inv_id} prod -> {dest_path}")
                 else:
-                    print(f"    ERROR downloading product image for inv#{inv_id}")
+                    _logger.log(f"    ERROR downloading product image for inv#{inv_id}")
                     errors += 1
 
-    print("  Generating data.js...")
+    _logger.log("  Generating data.js...")
     generate_data_js(public_path, sort_map=sort_map, lang_map=lang_map, cond_map=cond_map)
-    print("  data.js updated\n")
+    _logger.log("  data.js updated\n")
 
-    print(f"\n  {SEP}")
-    print(f"  Copied: {copied}")
-    print(f"  Skipped: {skipped}")
+    _logger.log(f"\n  {SEP}")
+    _logger.log(f"  Copied: {copied}")
+    _logger.log(f"  Skipped: {skipped}")
     if errors:
-        print(f"  Errors: {errors}")
-    print(f"  {SEP}\n")
+        _logger.log(f"  Errors: {errors}")
+    _logger.log(f"  {SEP}\n")
+    finalize_log(_logger, "export_public_images", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

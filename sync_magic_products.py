@@ -9,11 +9,15 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
+from task_logger import TaskLogger, finalize_log
+
 load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -24,6 +28,7 @@ PARAM_KEY_CAR_TYPE = "sync.magic.products.card.type"
 PARAM_KEY_MIG_LANG = "sync.magic.products.migration.languages"
 PARAM_KEY_FILES_PATH = "sync.magic.products.img.path"
 PARAM_KEY_IMG_PATH_PATTERN = "sync.magic.products.img.path.pattern"
+PARAM_KEY_LOG_PATH = "tasks.log.path"
 SEP = "=" * 58
 
 _token: str | None = None
@@ -115,10 +120,10 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        print(f"\n  [API {e.code}] {method} {path}")
+        (_logger or print)(f"\n  [API {e.code}] {method} {path}")
         return None
     except Exception as e:
-        print(f"\n  [API error] {method} {path}: {e}")
+        (_logger or print)(f"\n  [API error] {method} {path}: {e}")
         return None
 
 
@@ -149,7 +154,7 @@ def get_param(settings_by_key, param_key):
     param = settings_by_key.get(param_key)
     if param is None:
         raise RuntimeError(f"setting '{param_key}' not found")
-    print(f"  {param_key}: {param}")
+    (_logger or print)(f"  {param_key}: {param}")
     return param
 
 
@@ -200,6 +205,8 @@ def download_file(url):
 
 
 def sync():
+    global _logger
+
     print(f"\n{SEP}")
     print(f"  Searching Magic: The Gathering cards via CardVault API")
     print(SEP)
@@ -213,10 +220,19 @@ def sync():
     migration_languages = get_param(settings_by_key, PARAM_KEY_MIG_LANG)
     files_path = get_param(settings_by_key, PARAM_KEY_FILES_PATH)
     img_path_pattern = get_param(settings_by_key, PARAM_KEY_IMG_PATH_PATTERN)
+    log_path_setting = get_param(settings_by_key, PARAM_KEY_LOG_PATH)
     print(f"  Languages: {migration_languages}")
     print(SEP)
 
-    print("\n  Getting local API data...")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "magic_products")
+    _logger.log(SEP)
+    _logger.log("  Magic: The Gathering sync started")
+    _logger.log(SEP)
+    _logger.log(f"  API: {API_BASE}")
+    _logger.log(f"  Log path: {log_dir}")
+
+    _logger.log("\n  Getting local API data...")
     types = api_get_all("types")
     languages = api_get_all("languages")
     card_type_id = get_card_type_id(types, card_type)
@@ -232,17 +248,19 @@ def sync():
         raise RuntimeError("file type 'image' not found in types")
 
     scryfall_codes = [l.get("tcgdex_language_code") for l in languages if l.get("tcgdex_language_code")]
-    print(f"\n  Languages trad: {', '.join(scryfall_codes)}")
-    print(f"  Languages img: {', '.join(image_scryfall_codes)}")
+    _logger.log(f"\n  Languages trad: {', '.join(scryfall_codes)}")
+    _logger.log(f"  Languages img: {', '.join(image_scryfall_codes)}")
 
-    print(f"\n  Getting pending cards...")
+    _logger.log(f"\n  Getting pending cards...")
     pending = api_get_all("product-catalog", {
         "product_type_id": card_type_id,
         "pending_sync": 1,
         "per_page": 200
     })
-    print(f"  {len(pending)} pending cards\n")
+    _logger.log(f"  {len(pending)} pending cards\n")
     if not pending:
+        _logger.log("  No pending cards")
+        finalize_log(_logger, "magic_products", _API_ROOT, api_request)
         return
 
     pending_ids = [p["product_id"] for p in pending]
@@ -260,26 +278,24 @@ def sync():
 
         if set_code != current_set:
             current_set = set_code
-            print(f"\n  {SEP}")
-            print(f"  Set: {set_code}")
-            print(f"  {SEP}")
+            _logger.log(f"\n  {SEP}\n  Set: {set_code}\n  {SEP}")
 
-        print(f"  [{i + 1:>4}/{len(pending)}] {scryfall_id:<22}", end="", flush=True)
+        line = f"  [{i + 1:>4}/{len(pending)}] {scryfall_id:<22}"
 
         try:
             en_data = fetch_json(f"{api_base}/cards/{scryfall_id}")
         except Exception as e:
-            print(f"  error: {e}")
+            _logger.log(f"{line}  error: {e}")
             stats["not_found"] += 1
             continue
         if not en_data or not en_data.get("name"):
-            print("  not found")
+            _logger.log(f"{line}  not found")
             stats["not_found"] += 1
             continue
 
         en_name = en_data["name"]
         en_image_url = get_scryfall_image_url(en_data)
-        print(f" {en_name:<36}", end="", flush=True)
+        line += f" {en_name:<36}"
 
         try:
             translations = {}
@@ -294,7 +310,7 @@ def sync():
                 try:
                     t = fetch_json(f"{api_base}/cards/{scryfall_id}?locale={scryfall_code}")
                 except Exception as e:
-                    print(f"  trans '{scryfall_code}' error: {e}")
+                    _logger.log(f"  trans '{scryfall_code}' error: {e}")
                     continue
                 if t:
                     if t.get("name"):
@@ -304,7 +320,7 @@ def sync():
                         per_lang_image_url[scryfall_code] = img_url
                 time.sleep(0.05)
 
-            print(f" trans:[{','.join(translations.keys())}]", end="", flush=True)
+            line += f" trans:[{','.join(translations.keys())}]"
 
             img_results = []
             existing_img_lang_ids = img_by_product.get(product_id, set())
@@ -361,7 +377,8 @@ def sync():
                     img_results.append(f"{scryfall_code}=✗")
                     stats["img_fail"] += 1
 
-            print(f" img:[{','.join(img_results) or '—'}]")
+            line += f" img:[{','.join(img_results) or '—'}]"
+            _logger.log(line)
 
             for scryfall_code, t in translations.items():
                 existing = api_get("product-translations", {
@@ -384,28 +401,30 @@ def sync():
 
             img_ok_count = sum(1 for r in img_results if r.endswith("✓") or r.endswith("skip"))
             if img_results and img_ok_count == 0:
-                print("  no image saved, retry pending")
+                _logger.log("  no image saved, retry pending")
                 stats["not_found"] += 1
             else:
                 api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
                 stats["cards_ok"] += 1
         except Exception as e:
-            print(f"  error processing product: {e}")
+            _logger.log(f"  error processing product: {e}")
             stats["not_found"] += 1
 
         time.sleep(0.1)
 
-    print(f"\n{SEP}")
-    print(f"  Cards OK: {stats['cards_ok']}")
-    print(f"  Trads: {stats['trans']}")
-    print(f"  Imgs OK: {stats['img_ok']}")
+    _logger.log(f"\n{SEP}")
+    _logger.log(f"  Cards OK: {stats['cards_ok']}")
+    _logger.log(f"  Trads: {stats['trans']}")
+    _logger.log(f"  Imgs OK: {stats['img_ok']}")
     if stats["img_skip"]:
-        print(f"  Img skip: {stats['img_skip']}")
+        _logger.log(f"  Img skip: {stats['img_skip']}")
     if stats["img_fail"]:
-        print(f"  Img fail: {stats['img_fail']}")
+        _logger.log(f"  Img fail: {stats['img_fail']}")
     if stats["not_found"]:
-        print(f"  Cards not found: {stats['not_found']}")
-    print(SEP + "\n")
+        _logger.log(f"  Cards not found: {stats['not_found']}")
+    _logger.log(SEP + "\n")
+
+    finalize_log(_logger, "magic_products", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

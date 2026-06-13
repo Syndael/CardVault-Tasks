@@ -9,11 +9,15 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
+from task_logger import TaskLogger, finalize_log
+
 load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -24,6 +28,7 @@ PARAM_KEY_CAR_TYPE = "sync.digimon.products.card.type"
 PARAM_KEY_MIG_LANG = "sync.digimon.products.migration.languages"
 PARAM_KEY_FILES_PATH = "sync.digimon.products.img.path"
 PARAM_KEY_IMG_PATH_PATTERN = "sync.digimon.products.img.path.pattern"
+PARAM_KEY_LOG_PATH = "tasks.log.path"
 SEP = "=" * 58
 
 _URL_GLOBAL_OLD = "https://world.digimoncard.com/images/cardlist/card"
@@ -106,10 +111,10 @@ def api_request(method, path, data=None):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        print(f"\n  [API {e.code}] {method} {path}")
+        (_logger or print)(f"\n  [API {e.code}] {method} {path}")
         return None
     except Exception as e:
-        print(f"\n  [API error] {method} {path}: {e}")
+        (_logger or print)(f"\n  [API error] {method} {path}: {e}")
         return None
 
 
@@ -139,7 +144,7 @@ def get_param(settings_by_key, param_key):
     param = settings_by_key.get(param_key)
     if param is None:
         raise RuntimeError(f"setting '{param_key}' not found")
-    print(f"  {param_key}: {param}")
+    (_logger or print)(f"  {param_key}: {param}")
     return param
 
 
@@ -200,8 +205,12 @@ def _build_en_urls(card_id, set_code):
     return urls
 
 
-def _build_jp_urls(card_id):
-    return [f"{_URL_JP}/{card_id}{_IMG_EXT}"]
+def _build_jp_urls(card_id, alt_id=None):
+    urls = []
+    if alt_id and alt_id != card_id:
+        urls.append(f"{_URL_JP}/{alt_id}{_IMG_EXT}")
+    urls.append(f"{_URL_JP}/{card_id}{_IMG_EXT}")
+    return urls
 
 
 def _try_download_first(urls):
@@ -219,8 +228,8 @@ def try_download_image_en(card_id, set_code):
     return _try_download_first(_build_en_urls(card_id, set_code))
 
 
-def try_download_image_jp(card_id, _=None):
-    return _try_download_first(_build_jp_urls(card_id))
+def try_download_image_jp(card_id, alt_id=None):
+    return _try_download_first(_build_jp_urls(card_id, alt_id))
 
 
 def _find_card_id(pnum, set_code, api_base):
@@ -258,6 +267,8 @@ def _find_card_id(pnum, set_code, api_base):
 
 
 def sync():
+    global _logger
+
     print(f"\n{SEP}")
     print("  Searching Digimon TCG cards via CardVault API")
     print(SEP)
@@ -271,10 +282,19 @@ def sync():
     migration_languages = get_param(settings_by_key, PARAM_KEY_MIG_LANG)
     files_path = get_param(settings_by_key, PARAM_KEY_FILES_PATH)
     img_path_pattern = get_param(settings_by_key, PARAM_KEY_IMG_PATH_PATTERN)
+    log_path_setting = get_param(settings_by_key, PARAM_KEY_LOG_PATH)
     print(f"  Languages: {migration_languages}")
     print(SEP)
 
-    print("\n  Getting local API data...")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "digimon_products")
+    _logger.log(SEP)
+    _logger.log("  Digimon TCG sync started")
+    _logger.log(SEP)
+    _logger.log(f"  API: {API_BASE}")
+    _logger.log(f"  Log path: {log_dir}")
+
+    _logger.log("\n  Getting local API data...")
     types = api_get_all("types")
     languages = api_get_all("languages")
     card_type_id = get_card_type_id(types, card_type)
@@ -287,17 +307,20 @@ def sync():
             image_file_type_id = t["id"]
             break
     if not image_file_type_id:
+        _logger.log("ERROR: file type 'image' not found in types")
         raise RuntimeError("file type 'image' not found in types")
 
     lang_codes = [l.get("tcgdex_language_code") for l in languages if l.get("tcgdex_language_code")]
-    print(f"\n  Languages: {', '.join(lang_codes)}")
+    _logger.log(f"\n  Languages: {', '.join(lang_codes)}")
 
-    print(f"\n  Getting pending cards...")
+    _logger.log(f"\n  Getting pending cards...")
     pending = api_get_all("product-catalog", {
         "product_type_id": card_type_id, "pending_sync": 1, "per_page": 200
     })
-    print(f"  {len(pending)} pending cards\n")
+    _logger.log(f"  {len(pending)} pending cards\n")
     if not pending:
+        _logger.log("  No pending cards")
+        _finalize_log()
         return
 
     pending_ids = [p["product_id"] for p in pending]
@@ -312,62 +335,27 @@ def sync():
         product_number = product["product_number"]
         set_code = product["collection_code"]
 
-        if product_number.endswith("JP"):
-            print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  JP product", end="", flush=True)
-            card_id, card_data = _find_card_id(product_number.replace("JP", "").strip(), set_code, api_base)
-            if card_id and card_data:
-                en_name = card_data[0]["name"]
-                print(f" {en_name:<36} trans:", end="", flush=True)
-                translations = {}
-                for code in image_codes:
-                    lang_id = lang_by_abr[code]
-                    if code == "en":
-                        translations["en"] = {"name": en_name, "lang_id": lang_id}
-                        continue
-                    try:
-                        t = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(card_id)}")
-                    except Exception:
-                        continue
-                    if t and isinstance(t, list) and len(t) > 0 and t[0].get("name"):
-                        translations[code] = {"name": t[0]["name"], "lang_id": lang_id}
-                    time.sleep(0.05)
-                print(f"[{','.join(translations.keys())}]", end="", flush=True)
-                for code, t in translations.items():
-                    existing = api_get("product-translations", {
-                        "product_id": product_id, "language_id": t["lang_id"], "per_page": 1
-                    })
-                    existing_items = (existing or {}).get("items", [])
-                    if existing_items:
-                        api_request("PATCH", f"product-translations/{existing_items[0]['id']}", {"name": t["name"]})
-                    else:
-                        api_request("POST", "product-translations", {
-                            "product_id": product_id, "language_id": t["lang_id"], "name": t["name"]
-                        })
-                    stats["trans"] += 1
-                print("  img:[skip]")
-                api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
-                stats["cards_ok"] += 1
-            else:
-                print("  not found in API")
-                stats["not_found"] += 1
-                api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
-            continue
+        is_jp = product_number.endswith("JP")
+        raw_pnum = product_number.replace("JP", "").strip() if is_jp else product_number
+        jp_alt_id = f"{set_code}-{raw_pnum}" if is_jp else None
 
-        card_id, card_data = _find_card_id(product_number, set_code, api_base)
+        card_id, card_data = _find_card_id(raw_pnum, set_code, api_base)
 
         if set_code != current_set:
             current_set = set_code
-            print(f"\n  {SEP}\n  Set: {set_code}\n  {SEP}")
+            _logger.log(f"\n  {SEP}\n  Set: {set_code}\n  {SEP}")
 
         if not card_id or not card_data:
-            print(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}  not found in API")
+            suffix = "  JP product" if is_jp else ""
+            _logger.log(f"  [{i + 1:>4}/{len(pending)}] {set_code}-{product_number:<22}{suffix}  not found in API")
             stats["not_found"] += 1
             continue
 
-        print(f"  [{i + 1:>4}/{len(pending)}] {card_id:<22}", end="", flush=True)
+        suffix = "  JP product" if is_jp else ""
+        line = f"  [{i + 1:>4}/{len(pending)}] {card_id:<22}{suffix}"
 
         en_name = card_data[0]["name"]
-        print(f" {en_name:<36}", end="", flush=True)
+        line += f" {en_name:<36}"
 
         try:
             translations = {}
@@ -385,7 +373,7 @@ def sync():
                     translations[code] = {"name": t[0]["name"], "lang_id": lang_id}
                 time.sleep(0.05)
 
-            print(f" trans:[{','.join(translations.keys())}]", end="", flush=True)
+            line += f" trans:[{','.join(translations.keys())}]"
 
             img_results = []
             existing_img_lang_ids = img_by_product.get(product_id, set())
@@ -404,7 +392,7 @@ def sync():
                     continue
 
                 if code == "ja":
-                    image_data, used_url = try_download_image_jp(card_id)
+                    image_data, used_url = try_download_image_jp(card_id, jp_alt_id)
                 else:
                     image_data, used_url = try_download_image_en(card_id, set_code)
                 if image_data is None:
@@ -437,7 +425,8 @@ def sync():
                     img_results.append(f"{code}=✗")
                     stats["img_fail"] += 1
 
-            print(f" img:[{','.join(img_results) or '—'}]")
+            line += f" img:[{','.join(img_results) or '—'}]"
+            _logger.log(line)
 
             for code, t in translations.items():
                 existing = api_get("product-translations", {
@@ -457,25 +446,27 @@ def sync():
                 api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
                 stats["cards_ok"] += 1
             else:
-                print("  no image saved, retry pending")
+                _logger.log("  no image saved, retry pending")
                 stats["not_found"] += 1
         except Exception as e:
-            print(f"  error processing product: {e}")
+            _logger.log(f"  error processing product: {e}")
             stats["not_found"] += 1
 
         time.sleep(0.1)
 
-    print(f"\n{SEP}")
-    print(f"  Cards OK: {stats['cards_ok']}")
-    print(f"  Trads: {stats['trans']}")
-    print(f"  Imgs OK: {stats['img_ok']}")
+    _logger.log(f"\n{SEP}")
+    _logger.log(f"  Cards OK: {stats['cards_ok']}")
+    _logger.log(f"  Trads: {stats['trans']}")
+    _logger.log(f"  Imgs OK: {stats['img_ok']}")
     if stats["img_skip"]:
-        print(f"  Img skip: {stats['img_skip']}")
+        _logger.log(f"  Img skip: {stats['img_skip']}")
     if stats["img_fail"]:
-        print(f"  Img fail: {stats['img_fail']}")
+        _logger.log(f"  Img fail: {stats['img_fail']}")
     if stats["not_found"]:
-        print(f"  Cards not found: {stats['not_found']}")
-    print(SEP + "\n")
+        _logger.log(f"  Cards not found: {stats['not_found']}")
+    _logger.log(SEP + "\n")
+
+    finalize_log(_logger, "digimon_products", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

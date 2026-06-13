@@ -43,6 +43,7 @@ INSERT INTO settings (setting_key, setting_value) VALUES
 ('sync.digimon.products.migration.languages', 'en;'),
 ('sync.digimon.products.img.path', './../.files/products_images'),
 ('sync.digimon.products.img.path.pattern', '{card_type}/{is_manual}/{collection_code}'),
+('tasks.log.path', './../.files/task_logs'),
 ('sync.yugioh.collections.api.base', 'https://db.ygoprodeck.com/api/v7'),
 ('sync.yugioh.collections.card.type', 'YUG'),
 ('sync.yugioh.collections.migration.languages', 'en-EN;es-ES;'),

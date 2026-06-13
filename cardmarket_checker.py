@@ -10,6 +10,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
+from task_logger import TaskLogger, finalize_log
 
 try:
     from playwright.async_api import async_playwright
@@ -18,6 +19,11 @@ except ImportError:
     sys.exit(1)
 
 load_dotenv()
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 
@@ -34,6 +40,7 @@ WAIT_LOAD_MS = 3000
 CLOUDFLARE_WAIT = 15000
 PRICE_DAYS_THRESHOLD = 7
 SETTING_KEY_SKIP_THRESHOLD = "cardmarket.checker.price.skip"
+SETTING_LOG_PATH = "tasks.log.path"
 
 
 def _login() -> bool:
@@ -274,6 +281,8 @@ def find_browser_profile():
 
 
 async def main():
+    global _logger
+
     if not API_BASE or not API_USERNAME or not API_PASSWORD:
         print("Faltan CARDVAULT_API_* env vars")
         sys.exit(1)
@@ -291,7 +300,12 @@ async def main():
     if skip_threshold is not None:
         print(f"  Umbral de salto: {skip_threshold:.2f} €")
 
-    print("Obteniendo registros de product_price_tracking...")
+    log_path_setting = settings_by_key.get(SETTING_LOG_PATH, "./logs")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "cardmarket_checker")
+    _logger.log(f"  Log path: {log_dir}")
+
+    _logger.log("Obteniendo registros de product_price_tracking...")
     tracking_records = api_get_all("product-price-tracking")
 
     product_tracking = {}
@@ -305,16 +319,17 @@ async def main():
         product_tracking.setdefault(pid, []).append(tr)
 
     if not product_tracking:
-        print("No hay productos con tracking de CardMarket")
+        _logger.log("No hay productos con tracking de CardMarket")
+        finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
         return
-    print(f"  {len(product_tracking)} productos con tracking de CardMarket")
+    _logger.log(f"  {len(product_tracking)} productos con tracking de CardMarket")
 
-    print("Obteniendo idiomas...")
+    _logger.log("Obteniendo idiomas...")
     languages = {lang["id"]: lang for lang in api_get_all("languages")}
-    print("Obteniendo condiciones...")
+    _logger.log("Obteniendo condiciones...")
     conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
 
-    print("Obteniendo inventario...")
+    _logger.log("Obteniendo inventario...")
     inventory_items = api_get_all("inventory", {"all": "1", "per_page": 100})
 
     items_to_check = []
@@ -325,9 +340,10 @@ async def main():
             items_to_check.append(item)
 
     total = len(items_to_check)
-    print(f"  {total} items de inventario con tracking de CardMarket")
+    _logger.log(f"  {total} items de inventario con tracking de CardMarket")
 
     if total == 0:
+        finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
         return
 
     profile_dir, exe_path = find_browser_profile()
@@ -336,8 +352,8 @@ async def main():
     async with async_playwright() as pw:
         if profile_dir:
             browser_name = "Brave" if "Brave" in profile_dir or (exe_path and "brave" in exe_path.lower()) else "Chrome"
-            print(f"\n  Usando perfil real de {browser_name}: {profile_dir}")
-            print(f"  Asegurate de tener {browser_name} CERRADO antes de continuar.\n")
+            _logger.log(f"\n  Usando perfil real de {browser_name}: {profile_dir}")
+            _logger.log(f"  Asegurate de tener {browser_name} CERRADO antes de continuar.\n")
             launch_kwargs = dict(
                 user_data_dir=profile_dir,
                 headless=HEADLESS,
@@ -353,7 +369,7 @@ async def main():
             context = await pw.chromium.launch_persistent_context(**launch_kwargs)
             page = await context.new_page()
         else:
-            print("\n  Brave/Chrome no encontrado. Usando Chromium sin perfil.\n")
+            _logger.log("\n  Brave/Chrome no encontrado. Usando Chromium sin perfil.\n")
             browser = await pw.chromium.launch(
                 headless=HEADLESS,
                 slow_mo=80,
@@ -420,8 +436,8 @@ async def main():
                         full_url += "?" + urllib.parse.urlencode(params)
 
                     product_info = f"inv#{inv_id} {prod_name[:50]}"
-                    print(f"\n[{idx}/{total}] {product_info}")
-                    print(f"  URL: {full_url}")
+                    _logger.log(f"\n[{idx}/{total}] {product_info}")
+                    _logger.log(f"  URL: {full_url}")
 
                     history_records = api_get_all("inventory-price-history", {
                         "inventory_id": inv_id,
@@ -439,7 +455,7 @@ async def main():
                             if prev_dt.tzinfo is None:
                                 prev_dt = prev_dt.replace(tzinfo=timezone.utc)
                             if prev_dt >= cutoff:
-                                print(f"  Ya tiene precio dentro del margen de {PRICE_DAYS_THRESHOLD} día(s) ({prev_date_str}), saltando")
+                                _logger.log(f"  Ya tiene precio dentro del margen de {PRICE_DAYS_THRESHOLD} día(s) ({prev_date_str}), saltando")
                                 continue
                         except ValueError:
                             pass
@@ -447,7 +463,7 @@ async def main():
                     if prev and skip_threshold is not None:
                         prev_price_val = float(prev["price"])
                         if prev_price_val < skip_threshold:
-                            print(f"  Precio previo ({prev_price_val:.2f}) < umbral ({skip_threshold:.2f}), saltando")
+                            _logger.log(f"  Precio previo ({prev_price_val:.2f}) < umbral ({skip_threshold:.2f}), saltando")
                             continue
 
                     price_str = await scrape_price(page, full_url)
@@ -457,18 +473,18 @@ async def main():
                         try:
                             new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
                         except ValueError:
-                            print(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
+                            _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
                             html = await page.content()
                             fallback = extract_price_from_html(html)
                             if fallback:
                                 price_str = fallback
                                 new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
-                                print(f"  Precio recuperado del HTML: {price_str}")
+                                _logger.log(f"  Precio recuperado del HTML: {price_str}")
                             else:
-                                print(f"  No se pudo recuperar precio del HTML")
+                                _logger.log(f"  No se pudo recuperar precio del HTML")
                                 error_count += 1
                                 continue
-                        print(f"  Precio encontrado: {price_str}")
+                        _logger.log(f"  Precio encontrado: {price_str}")
 
                         if prev is None:
                             min_price = new_price
@@ -502,31 +518,32 @@ async def main():
                         try:
                             result = api_post("inventory-price-history", post_data)
                             saved_count += 1
-                            print(f"  Guardado en inventory_price_history (id={result.get('id', '?')})")
+                            _logger.log(f"  Guardado en inventory_price_history (id={result.get('id', '?')})")
                         except Exception as e:
                             error_count += 1
-                            print(f"  Error al guardar: {e}")
+                            _logger.log(f"  Error al guardar: {e}")
                     else:
                         error_count += 1
-                        print(f"  Precio no encontrado")
+                        _logger.log(f"  Precio no encontrado")
 
                     if idx < total:
                         delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                        print(f"  Pausa {delay:.1f} s...")
+                        _logger.log(f"  Pausa {delay:.1f} s...")
                         await asyncio.sleep(delay)
                 except Exception as e:
                     error_count += 1
-                    print(f"  Error en enlace: {e}")
+                    _logger.log(f"  Error en enlace: {e}")
                     continue
 
         await context.close()
 
-    print(f"\n  {SEP}")
-    print(f"  Procesados:     {total}")
-    print(f"  Scrapeados:     {scraped_count}")
-    print(f"  Guardados:      {saved_count}")
-    print(f"  Errores:        {error_count}")
-    print(f"  {SEP}\n")
+    _logger.log(f"\n  {SEP}")
+    _logger.log(f"  Procesados:     {total}")
+    _logger.log(f"  Scrapeados:     {scraped_count}")
+    _logger.log(f"  Guardados:      {saved_count}")
+    _logger.log(f"  Errores:        {error_count}")
+    _logger.log(f"  {SEP}\n")
+    finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":

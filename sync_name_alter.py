@@ -6,8 +6,14 @@ import urllib.request
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+from task_logger import TaskLogger, finalize_log
 
 load_dotenv()
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
+
+_logger: TaskLogger | None = None
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -15,6 +21,7 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 
 SETTING_TARGETS = "sync.name.alter.lang.targets"
 SETTING_SOURCES = "sync.name.alter.lang.sources"
+SETTING_LOG_PATH = "tasks.log.path"
 
 DEFAULT_TARGETS = "JP,KR,CHT,CHS"
 DEFAULT_SOURCES = "ES,EN"
@@ -94,7 +101,7 @@ def api_request(method, path, data=None, timeout=15):
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
-        print(f"  API error {e.code} on {method} {url}", file=sys.stderr)
+        (_logger or print)(f"  API error {e.code} on {method} {url}")
         return None
     except Exception:
         return None
@@ -130,6 +137,8 @@ def get_all_paginated(resource, params=None):
 
 
 def main():
+    global _logger
+
     if not API_BASE:
         print("CARDVAULT_API_BASE not set")
         sys.exit(1)
@@ -149,10 +158,18 @@ def main():
     print(f"Target languages (from settings): {', '.join(sorted(target_abbr))}")
     print(f"Source languages (from settings): {', '.join(source_priority)}")
 
-    print("Fetching languages...")
+    log_path_setting = settings.get(SETTING_LOG_PATH, "./logs")
+    log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
+    _logger = TaskLogger(log_dir, "name_alter")
+    _logger.log(f"  Target languages: {', '.join(sorted(target_abbr))}")
+    _logger.log(f"  Source languages: {', '.join(source_priority)}")
+    _logger.log(f"  Log path: {log_dir}")
+
+    _logger.log("Fetching languages...")
     languages = api_get("languages?per_page=200")
     if not languages:
-        print("Failed to fetch languages")
+        _logger.log("Failed to fetch languages")
+        finalize_log(_logger, "name_alter", _API_ROOT, api_request)
         sys.exit(1)
     lang_items = languages.get("items") or []
 
@@ -168,40 +185,42 @@ def main():
                 source_map[src_abbr] = lang["id"]
 
     if not target_ids:
-        print(f"No target languages found for: {', '.join(sorted(target_abbr))}")
-        sys.exit(0)
+        _logger.log(f"No target languages found for: {', '.join(sorted(target_abbr))}")
+        finalize_log(_logger, "name_alter", _API_ROOT, api_request)
+        return
 
     if not source_map:
-        print(f"No source languages found for: {', '.join(source_priority)}")
-        sys.exit(0)
+        _logger.log(f"No source languages found for: {', '.join(source_priority)}")
+        finalize_log(_logger, "name_alter", _API_ROOT, api_request)
+        return
 
     product_source = {}
     for src_abbr, src_id in source_map.items():
-        print(f"Fetching {src_abbr} product translations...")
+        _logger.log(f"Fetching {src_abbr} product translations...")
         trans_list = get_all_paginated("product-translations", {"language_id": src_id})
         for t in trans_list:
             pid = t.get("product").get("id")
             name = t.get("name", "").strip()
             if pid and name and pid not in product_source:
                 product_source[pid] = name
-        print(f"  Got {len(trans_list)} translations, lookup now has {len(product_source)} products")
+        _logger.log(f"  Got {len(trans_list)} translations, lookup now has {len(product_source)} products")
 
     collection_source = {}
     for src_abbr, src_id in source_map.items():
-        print(f"Fetching {src_abbr} collection translations...")
+        _logger.log(f"Fetching {src_abbr} collection translations...")
         trans_list = get_all_paginated("collection-translations", {"language_id": src_id})
         for t in trans_list:
             cid = t.get("collection_id")
             name = t.get("name", "").strip()
             if cid and name and cid not in collection_source:
                 collection_source[cid] = name
-        print(f"  Got {len(trans_list)} translations, lookup now has {len(collection_source)} collections")
+        _logger.log(f"  Got {len(trans_list)} translations, lookup now has {len(collection_source)} collections")
 
     total_updated = 0
 
     for lang_id in target_ids:
         lang_abbr = next((l.get("abbreviation", "") for l in lang_items if l.get("id") == lang_id), str(lang_id))
-        print(f"Processing product translations for language {lang_id} ({lang_abbr})...")
+        _logger.log(f"Processing product translations for language {lang_id} ({lang_abbr})...")
         target_trans = get_all_paginated("product-translations", {"language_id": lang_id, "name_alter": "__empty__"})
         for t in target_trans:
             pid = t.get("product_id") or (t.get("product") or {}).get("id")
@@ -217,13 +236,13 @@ def main():
             try:
                 api_patch(f"product-translations/{tid}", {"name_alter": source_name})
                 total_updated += 1
-                print(f"  [{lang_abbr}] product {ref}: \"{original_name}\" → \"{source_name}\"")
+                _logger.log(f"  [{lang_abbr}] product {ref}: \"{original_name}\" → \"{source_name}\"")
             except Exception as e:
-                print(f"  Error updating product translation {tid}: {e}")
+                _logger.log(f"  Error updating product translation {tid}: {e}")
 
     for lang_id in target_ids:
         lang_abbr = next((l.get("abbreviation", "") for l in lang_items if l.get("id") == lang_id), str(lang_id))
-        print(f"Processing collection translations for language {lang_id} ({lang_abbr})...")
+        _logger.log(f"Processing collection translations for language {lang_id} ({lang_abbr})...")
         target_trans = get_all_paginated("collection-translations", {"language_id": lang_id, "name_alter": "__empty__"})
         for t in target_trans:
             cid = t.get("collection_id")
@@ -235,11 +254,12 @@ def main():
             try:
                 api_patch(f"collection-translations/{tid}", {"name_alter": source_name})
                 total_updated += 1
-                print(f"  [{lang_abbr}] collection {cid}: \"{original_name}\" → \"{source_name}\"")
+                _logger.log(f"  [{lang_abbr}] collection {cid}: \"{original_name}\" → \"{source_name}\"")
             except Exception as e:
-                print(f"  Error updating collection translation {tid}: {e}")
+                _logger.log(f"  Error updating collection translation {tid}: {e}")
 
-    print(f"Completed. Updated {total_updated} translations.")
+    _logger.log(f"Completed. Updated {total_updated} translations.")
+    finalize_log(_logger, "name_alter", _API_ROOT, api_request)
 
 
 if __name__ == "__main__":
