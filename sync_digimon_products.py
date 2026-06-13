@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import hashlib
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ PARAM_KEY_FILES_PATH = "sync.digimon.products.img.path"
 PARAM_KEY_IMG_PATH_PATTERN = "sync.digimon.products.img.path.pattern"
 PARAM_KEY_LOG_PATH = "tasks.log.path"
 SEP = "=" * 58
+SCRIPT_VERSION = "digimon-products-image-rules-2026-06-13"
 
 _URL_GLOBAL_OLD = "https://world.digimoncard.com/images/cardlist/card"
 _URL_BANDAI = "https://s3.amazonaws.com/prod.bandaitcgplus.files.api/card_image/DG-EN"
@@ -39,6 +41,14 @@ _IMG_EXT = ".png"
 
 _token: str | None = None
 _token_expires_at: datetime | None = None
+
+
+def _script_sha1():
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:12]
+    except Exception:
+        return "unknown"
 
 
 def _login() -> bool:
@@ -328,6 +338,7 @@ def sync():
     _logger.log(SEP)
     _logger.log(f"  API: {API_BASE}")
     _logger.log(f"  Log path: {log_dir}")
+    _logger.log(f"  Script: {SCRIPT_VERSION} sha1={_script_sha1()} path={__file__}")
 
     _logger.log("\n  Getting local API data...")
     types = api_get_all("types")

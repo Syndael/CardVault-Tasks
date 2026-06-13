@@ -72,3 +72,6 @@ VALUES ('Scrapeo PokeCollector (cartas JP)', 'sync_pokemon_pokecollector.py', '0
 
 INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
 VALUES ('CardMarket checker de precios', 'cardmarket_checker.py', '30 8 1,15 * *', 1);
+
+INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
+VALUES ('Limpiador de imágenes', 'clean_orphan_product_images.py', '0 6 1,15 * *', 1);
