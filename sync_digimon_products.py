@@ -320,7 +320,7 @@ def sync():
     _logger.log(f"  {len(pending)} pending cards\n")
     if not pending:
         _logger.log("  No pending cards")
-        _finalize_log()
+        finalize_log(_logger, "digimon_products", _API_ROOT, api_request)
         return
 
     pending_ids = [p["product_id"] for p in pending]
