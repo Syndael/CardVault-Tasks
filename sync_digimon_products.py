@@ -181,8 +181,44 @@ def get_existing_images(files, product_id):
     return result
 
 
+def _has_jp_marker(value):
+    if not value:
+        return False
+    text = str(value).strip().upper()
+    if text.endswith("JP"):
+        return True
+    normalized = text
+    for ch in "()[]{}":
+        normalized = normalized.replace(ch, " ")
+    return "JP" in normalized.split()
+
+
+def _strip_jp_suffix(value):
+    text = (value or "").strip()
+    return text[:-2].strip() if text.upper().endswith("JP") else text
+
+
+def _is_alt_product_number(value):
+    return "_P" in (value or "")
+
+
+def _image_codes_for_product(raw_pnum, is_jp, lang_by_abr):
+    if not _is_alt_product_number(raw_pnum):
+        return [code for code in ("en", "ja") if code in lang_by_abr]
+    wanted = "ja" if is_jp else "en"
+    return [wanted] if wanted in lang_by_abr else []
+
+
+def _missing_image_codes(image_codes, existing_img_lang_ids, lang_by_abr):
+    return [
+        code for code in image_codes
+        if lang_by_abr.get(code) not in existing_img_lang_ids
+    ]
+
+
 def _build_en_urls(card_id, set_code):
     urls = []
+    urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
     for fmt in (
         card_id,
         f"{card_id}_dummy",
@@ -200,7 +236,6 @@ def _build_en_urls(card_id, set_code):
             f"{std_id}P",
         ):
             urls.append(f"{_URL_BANDAI}/{set_code}/{fmt}{_IMG_EXT}")
-    urls.append(f"{_URL_GLOBAL_OLD}/{card_id}{_IMG_EXT}")
     urls.append(f"{_URL_DIGIMON_IO}/{urllib.parse.quote(card_id)}.jpg")
     return urls
 
@@ -314,18 +349,41 @@ def sync():
     _logger.log(f"\n  Languages: {', '.join(lang_codes)}")
 
     _logger.log(f"\n  Getting pending cards...")
-    pending = api_get_all("product-catalog", {
-        "product_type_id": card_type_id, "pending_sync": 1, "per_page": 200
+    pending_sync = api_get_all("product-catalog", {
+        "product_type_id": card_type_id, "pending_sync": 1, "is_manual": 0, "per_page": 200
     })
-    _logger.log(f"  {len(pending)} pending cards\n")
+    pending_sync_ids = {p["product_id"] for p in pending_sync}
+
+    all_products = api_get_all("product-catalog", {
+        "product_type_id": card_type_id, "is_manual": 0, "per_page": 200
+    })
+    all_product_ids = [p["product_id"] for p in all_products]
+    all_files = api_get_all("files", {"per_page": 500})
+    img_by_product = {pid: get_existing_images(all_files, pid) for pid in all_product_ids}
+
+    pending = []
+    for product in all_products:
+        product_id = product["product_id"]
+        product_number = product["product_number"]
+        product_name = product.get("product_name", "")
+        is_jp = _has_jp_marker(product_number) or _has_jp_marker(product_name)
+        raw_pnum = _strip_jp_suffix(product_number) if is_jp else product_number
+        target_image_codes = _image_codes_for_product(raw_pnum, is_jp, lang_by_abr)
+        missing_image_codes = _missing_image_codes(
+            target_image_codes, img_by_product.get(product_id, set()), lang_by_abr
+        )
+        needs_name = not (product_name or "").strip()
+        if needs_name or missing_image_codes or product_id in pending_sync_ids:
+            pending.append(product)
+
+    _logger.log(
+        f"  {len(pending)} pending cards "
+        f"({len(pending_sync_ids)} API pending, {len(all_products)} scanned)\n"
+    )
     if not pending:
         _logger.log("  No pending cards")
         finalize_log(_logger, "digimon_products", _API_ROOT, api_request)
         return
-
-    pending_ids = [p["product_id"] for p in pending]
-    all_files = api_get_all("files", {"per_page": 500})
-    img_by_product = {pid: get_existing_images(all_files, pid) for pid in pending_ids}
 
     stats = {"cards_ok": 0, "not_found": 0, "trans": 0, "img_ok": 0, "img_skip": 0, "img_fail": 0}
     current_set = None
@@ -333,13 +391,17 @@ def sync():
     for i, product in enumerate(pending):
         product_id = product["product_id"]
         product_number = product["product_number"]
+        product_name = product.get("product_name", "")
         set_code = product["collection_code"]
 
-        is_jp = product_number.endswith("JP")
-        raw_pnum = product_number.replace("JP", "").strip() if is_jp else product_number
-        jp_alt_id = f"{set_code}-{raw_pnum}" if is_jp else None
+        needs_name = not (product_name or "").strip()
+        is_jp = _has_jp_marker(product_number) or _has_jp_marker(product_name)
+        raw_pnum = _strip_jp_suffix(product_number) if is_jp else product_number
+        image_card_id = f"{set_code}-{raw_pnum}" if _is_alt_product_number(raw_pnum) else None
+        jp_alt_id = image_card_id if is_jp else None
 
         card_id, card_data = _find_card_id(raw_pnum, set_code, api_base)
+        image_card_id = image_card_id or card_id
 
         if set_code != current_set:
             current_set = set_code
@@ -359,19 +421,20 @@ def sync():
 
         try:
             translations = {}
-            for code in image_codes:
-                lang_id = lang_by_abr[code]
-                if code == "en":
-                    translations["en"] = {"name": en_name, "lang_id": lang_id}
-                    continue
+            if needs_name:
+                for code in image_codes:
+                    lang_id = lang_by_abr[code]
+                    if code == "en":
+                        translations["en"] = {"name": en_name, "lang_id": lang_id}
+                        continue
 
-                try:
-                    t = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(card_id)}")
-                except Exception:
-                    continue
-                if t and isinstance(t, list) and len(t) > 0 and t[0].get("name"):
-                    translations[code] = {"name": t[0]["name"], "lang_id": lang_id}
-                time.sleep(0.05)
+                    try:
+                        t = fetch_json(f"{api_base.rstrip('/')}/search?card={urllib.parse.quote(card_id)}")
+                    except Exception:
+                        continue
+                    if t and isinstance(t, list) and len(t) > 0 and t[0].get("name"):
+                        translations[code] = {"name": t[0]["name"], "lang_id": lang_id}
+                    time.sleep(0.05)
 
             line += f" trans:[{','.join(translations.keys())}]"
 
@@ -384,9 +447,11 @@ def sync():
             target_dir = os.path.join(base_dir, sub_dir)
             os.makedirs(target_dir, exist_ok=True)
 
-            for code in image_codes:
+            target_image_codes = _image_codes_for_product(raw_pnum, is_jp, lang_by_abr)
+            missing_image_codes = _missing_image_codes(target_image_codes, existing_img_lang_ids, lang_by_abr)
+            for code in target_image_codes:
                 lang_id = lang_by_abr.get(code)
-                if lang_id and lang_id in existing_img_lang_ids:
+                if code not in missing_image_codes:
                     img_results.append(f"{code}=skip")
                     stats["img_skip"] += 1
                     continue
@@ -394,13 +459,13 @@ def sync():
                 if code == "ja":
                     image_data, used_url = try_download_image_jp(card_id, jp_alt_id)
                 else:
-                    image_data, used_url = try_download_image_en(card_id, set_code)
+                    image_data, used_url = try_download_image_en(image_card_id, set_code)
                 if image_data is None:
                     img_results.append(f"{code}=—")
                     continue
 
                 ext = used_url.rsplit(".", 1)[-1] if used_url else "jpg"
-                original_name = f"{card_id}_{code}.{ext}"
+                original_name = f"{image_card_id}_{code}.{ext}"
                 stored_name = original_name
                 local_rel = os.path.join(files_path, sub_dir, stored_name)
                 local_abs = os.path.join(base_dir, sub_dir, stored_name)
@@ -442,7 +507,7 @@ def sync():
                 stats["trans"] += 1
 
             img_ok_count = sum(1 for r in img_results if r.endswith("✓") or r.endswith("skip"))
-            if img_ok_count > 0:
+            if img_ok_count > 0 or translations:
                 api_request("PATCH", f"products/{product_id}", {"force_download": False, "is_manual": False})
                 stats["cards_ok"] += 1
             else:
