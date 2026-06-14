@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -184,6 +185,12 @@ def _fetch_task(task_id):
     return {}
 
 
+def _stream_output(stream, lines):
+    for line in iter(stream.readline, ""):
+        print(line, end="", flush=True)
+        lines.append(line)
+
+
 def run_execution(execution):
     exec_id = execution["id"]
     task = execution.get("scheduled_task") or _fetch_task(execution.get("scheduled_task_id"))
@@ -205,24 +212,41 @@ def run_execution(execution):
             script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_path)
 
         TASK_TIMEOUT = 14400
-        result = subprocess.run(
+        process = subprocess.Popen(
             [sys.executable, script_path],
-            capture_output=True, text=True, timeout=TASK_TIMEOUT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
             env={**os.environ, "PYTHONUNBUFFERED": "1", "CARDVAULT_TASK_EXECUTION_ID": str(exec_id)},
         )
-        output = result.stdout
-        if result.stderr:
-            output += "\n--- stderr ---\n" + result.stderr
 
-        if result.returncode == 0:
+        stdout_lines = []
+        stderr_lines = []
+
+        threads = [
+            threading.Thread(target=_stream_output, args=(process.stdout, stdout_lines)),
+            threading.Thread(target=_stream_output, args=(process.stderr, stderr_lines)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TASK_TIMEOUT)
+
+        process.wait(timeout=10)
+
+        output = "".join(stdout_lines)
+        if stderr_lines:
+            output += "\n--- stderr ---\n" + "".join(stderr_lines)
+
+        if process.returncode == 0:
             status = "completed"
-            log.info("'%s' completed (exit %d)", task_name, result.returncode)
+            log.info("'%s' completed (exit %d)", task_name, process.returncode)
         else:
             status = "error"
-            log.warning("'%s' failed (exit %d)", task_name, result.returncode)
+            log.warning("'%s' failed (exit %d)", task_name, process.returncode)
 
         update_execution(exec_id, status, finished_at=dt_to_str(datetime.now()), output=output)
     except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
         update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()),
                          output=f"Timeout after {TASK_TIMEOUT}s")
         log.error("'%s' timed out", task_name)
