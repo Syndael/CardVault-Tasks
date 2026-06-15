@@ -59,7 +59,8 @@ INSERT INTO settings (setting_key, setting_value) VALUES
 ('sync.one-piece.products.card.type', 'OP'),
 ('sync.one-piece.products.migration.languages', 'en;es;'),
 ('sync.one-piece.products.img.path', './../.files/products_images'),
-('sync.one-piece.products.img.path.pattern', '{card_type}/{is_manual}/{collection_code}');
+('sync.one-piece.products.img.path.pattern', '{card_type}/{is_manual}/{collection_code}'),
+('tasks.log.path', './../.files/task_logs');
 
 INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
 VALUES ('Buscar productos Digimon (alt arts)', 'find_digimon_products.py', '0 12 * * 1', 1);
@@ -75,3 +76,6 @@ VALUES ('CardMarket checker de precios', 'cardmarket_checker.py', '30 8 1,15 * *
 
 INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
 VALUES ('Limpiador de imágenes', 'clean_orphan_product_images.py', '0 6 1,15 * *', 1);
+
+INSERT INTO scheduled_tasks(name, script_path, cron_expression, enabled)
+VALUES ('Wishlist checker de precios', 'wishlist_checker.py', '0 */6 * * *', 1);

@@ -38,8 +38,9 @@ DELAY_MIN = 10.0
 DELAY_MAX = 18.0
 WAIT_LOAD_MS = 3000
 CLOUDFLARE_WAIT = 15000
-PRICE_DAYS_THRESHOLD = 7
 SETTING_KEY_SKIP_THRESHOLD = "cardmarket.checker.price.skip"
+SETTING_KEY_PRICE_MINUTES = "cardmarket.checker.price.minutes"
+SETTING_KEY_WISHLIST_MINUTES = "cardmarket.checker.wishlist.minutes"
 SETTING_LOG_PATH = "tasks.log.path"
 
 
@@ -280,7 +281,7 @@ def find_browser_profile():
     return None, None
 
 
-async def main():
+def main():
     global _logger
 
     if not API_BASE or not API_USERNAME or not API_PASSWORD:
@@ -299,6 +300,16 @@ async def main():
     skip_threshold = float(skip_threshold_str) if skip_threshold_str else None
     if skip_threshold is not None:
         print(f"  Umbral de salto: {skip_threshold:.2f} €")
+
+    price_minutes_str = settings_by_key.get(SETTING_KEY_PRICE_MINUTES)
+    if price_minutes_str:
+        try:
+            PRICE_MINUTES_THRESHOLD = int(price_minutes_str)
+        except ValueError:
+            PRICE_MINUTES_THRESHOLD = 10080
+    else:
+        PRICE_MINUTES_THRESHOLD = 10080
+    print(f"  Minutos umbral de precio: {PRICE_MINUTES_THRESHOLD}")
 
     log_path_setting = settings_by_key.get(SETTING_LOG_PATH, "./logs")
     log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
@@ -324,6 +335,12 @@ async def main():
         return
     _logger.log(f"  {len(product_tracking)} productos con tracking de CardMarket")
 
+    wishlist_minutes_str = settings_by_key.get(SETTING_KEY_WISHLIST_MINUTES)
+    wishlist_minutes_threshold = int(wishlist_minutes_str) if wishlist_minutes_str else None
+    if wishlist_minutes_threshold is not None:
+        _logger.log(f"  Minutos salto wishlist: {wishlist_minutes_threshold}")
+
+    # --- Inventory ---
     _logger.log("Obteniendo idiomas...")
     languages = {lang["id"]: lang for lang in api_get_all("languages")}
     _logger.log("Obteniendo condiciones...")
@@ -339,53 +356,26 @@ async def main():
         if prod_id and prod_id in product_tracking:
             items_to_check.append(item)
 
-    total = len(items_to_check)
-    _logger.log(f"  {total} items de inventario con tracking de CardMarket")
+    _logger.log(f"  {len(items_to_check)} items de inventario con tracking de CardMarket")
 
-    if total == 0:
-        finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
-        return
+    if items_to_check:
+        asyncio.run(process_inventory(items_to_check, product_tracking, languages, conditions, skip_threshold, PRICE_MINUTES_THRESHOLD))
 
+    # --- Wishlist ---
+    _logger.log("Obteniendo wishlist items...")
+    asyncio.run(process_wishlist(product_tracking, wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD))
+
+    finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
+
+
+async def process_inventory(items_to_check, product_tracking, languages, conditions, skip_threshold, price_minutes):
+    global _logger
     profile_dir, exe_path = find_browser_profile()
     SEP = "=" * 58
+    total = len(items_to_check)
 
     async with async_playwright() as pw:
-        if profile_dir:
-            browser_name = "Brave" if "Brave" in profile_dir or (exe_path and "brave" in exe_path.lower()) else "Chrome"
-            _logger.log(f"\n  Usando perfil real de {browser_name}: {profile_dir}")
-            _logger.log(f"  Asegurate de tener {browser_name} CERRADO antes de continuar.\n")
-            launch_kwargs = dict(
-                user_data_dir=profile_dir,
-                headless=HEADLESS,
-                slow_mo=80,
-                args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-                no_viewport=True,
-                locale="es-ES",
-            )
-            if exe_path:
-                launch_kwargs["executable_path"] = exe_path
-            else:
-                launch_kwargs["channel"] = "chrome"
-            context = await pw.chromium.launch_persistent_context(**launch_kwargs)
-            page = await context.new_page()
-        else:
-            _logger.log("\n  Brave/Chrome no encontrado. Usando Chromium sin perfil.\n")
-            browser = await pw.chromium.launch(
-                headless=HEADLESS,
-                slow_mo=80,
-                args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
-            )
-            context = await browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                locale="es-ES",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            page = await context.new_page()
-
+        context, page = await _setup_browser(pw, profile_dir, exe_path)
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
@@ -439,92 +429,20 @@ async def main():
                     _logger.log(f"\n[{idx}/{total}] {product_info}")
                     _logger.log(f"  URL: {full_url}")
 
-                    history_records = api_get_all("inventory-price-history", {
+                    skip = await _check_history_skip("inventory-price-history", {
                         "inventory_id": inv_id,
                         "product_price_tracking_id": tr["id"],
-                    })
-                    prev = None
-                    if history_records:
-                        prev = max(history_records, key=lambda r: r.get("recorded_at", ""))
-
-                    cutoff = (datetime.now(timezone.utc) - timedelta(days=PRICE_DAYS_THRESHOLD - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                    prev_date_str = (prev or {}).get("recorded_at", "")
-                    if prev and prev_date_str:
-                        try:
-                            prev_dt = datetime.fromisoformat(prev_date_str)
-                            if prev_dt.tzinfo is None:
-                                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-                            if prev_dt >= cutoff:
-                                _logger.log(f"  Ya tiene precio dentro del margen de {PRICE_DAYS_THRESHOLD} día(s) ({prev_date_str}), saltando")
-                                continue
-                        except ValueError:
-                            pass
-
-                    if prev and skip_threshold is not None:
-                        prev_price_val = float(prev["price"])
-                        if prev_price_val < skip_threshold:
-                            _logger.log(f"  Precio previo ({prev_price_val:.2f}) < umbral ({skip_threshold:.2f}), saltando")
-                            continue
+                    }, skip_threshold, price_minutes)
+                    if skip:
+                        continue
 
                     price_str = await scrape_price(page, full_url)
-
-                    if price_str and price_str != "NO_ENCONTRADO":
+                    result = await _save_inventory_price(inv_id, tr["id"], price_str, page)
+                    if result:
                         scraped_count += 1
-                        try:
-                            new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
-                        except ValueError:
-                            _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
-                            html = await page.content()
-                            fallback = extract_price_from_html(html)
-                            if fallback:
-                                price_str = fallback
-                                new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
-                                _logger.log(f"  Precio recuperado del HTML: {price_str}")
-                            else:
-                                _logger.log(f"  No se pudo recuperar precio del HTML")
-                                error_count += 1
-                                continue
-                        _logger.log(f"  Precio encontrado: {price_str}")
-
-                        if prev is None:
-                            min_price = new_price
-                            max_price = new_price
-                            min_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                            max_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                        else:
-                            prev_price = float(prev["price"])
-                            prev_min = float(prev["min_price"]) if prev.get("min_price") else prev_price
-                            prev_max = float(prev["max_price"]) if prev.get("max_price") else prev_price
-
-                            min_price = min(new_price, prev_min, prev_price)
-                            max_price = max(new_price, prev_max, prev_price)
-
-                            min_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                                        if min_price != prev_min
-                                        else prev.get("min_price_recorded_at"))
-                            max_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                                        if max_price != prev_max
-                                        else prev.get("max_price_recorded_at"))
-
-                        post_data = {
-                            "inventory_id": inv_id,
-                            "product_price_tracking_id": tr["id"],
-                            "price": f"{new_price:.2f}",
-                            "min_price": f"{min_price:.2f}",
-                            "max_price": f"{max_price:.2f}",
-                            "min_price_recorded_at": min_date,
-                            "max_price_recorded_at": max_date,
-                        }
-                        try:
-                            result = api_post("inventory-price-history", post_data)
-                            saved_count += 1
-                            _logger.log(f"  Guardado en inventory_price_history (id={result.get('id', '?')})")
-                        except Exception as e:
-                            error_count += 1
-                            _logger.log(f"  Error al guardar: {e}")
+                        saved_count += 1
                     else:
                         error_count += 1
-                        _logger.log(f"  Precio no encontrado")
 
                     if idx < total:
                         delay = random.uniform(DELAY_MIN, DELAY_MAX)
@@ -543,12 +461,277 @@ async def main():
     _logger.log(f"  Guardados:      {saved_count}")
     _logger.log(f"  Errores:        {error_count}")
     _logger.log(f"  {SEP}\n")
-    finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
+
+
+async def process_wishlist(product_tracking, wishlist_minutes, price_minutes):
+    global _logger
+    _logger.log("Obteniendo wishlist items activos...")
+    wishlist_items = api_get_all("wishlist-items")
+    items = [wi for wi in wishlist_items if wi.get("w_state", "buscando") in ("buscando", "notificado")]
+    _logger.log(f"  {len(items)} items en wishlist con estado 'buscando' o 'notificado'")
+
+    if not items:
+        return
+
+    profile_dir, exe_path = find_browser_profile()
+    SEP = "=" * 58
+
+    async with async_playwright() as pw:
+        context, page = await _setup_browser(pw, profile_dir, exe_path)
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+        """)
+
+        scraped_count = 0
+        saved_count = 0
+        error_count = 0
+        total = len(items)
+
+        for idx, wi in enumerate(items, 1):
+            prod_id = wi.get("product_id")
+            item_id = wi["id"]
+            product_number = wi.get("product_number") or ""
+            collection_code = wi.get("collection_code") or ""
+            product_name = wi.get("product_name") or ""
+
+            tracking_list = product_tracking.get(prod_id, [])
+            if not tracking_list:
+                _logger.log(f"\n[{idx}/{total}] wish#{item_id} {product_name or product_number}: sin tracking URL, saltando")
+                continue
+
+            for tr in tracking_list:
+                try:
+                    base_url = tr.get("url", "").strip()
+                    if not base_url:
+                        continue
+
+                    full_url = base_url
+
+                    product_info = f"wish#{item_id} {product_name or product_number[:50]}"
+                    _logger.log(f"\n[{idx}/{total}] {product_info}")
+                    _logger.log(f"  URL: {full_url}")
+
+                    skip = await _check_history_skip_no_inventory(item_id, tr["id"], wishlist_minutes, price_minutes)
+                    if skip:
+                        continue
+
+                    price_str = await scrape_price(page, full_url)
+
+                    if price_str and price_str != "NO_ENCONTRADO":
+                        scraped_count += 1
+                        try:
+                            new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+                        except ValueError:
+                            _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
+                            html = await page.content()
+                            fallback = extract_price_from_html(html)
+                            if fallback:
+                                price_str = fallback
+                            else:
+                                _logger.log(f"  No se pudo recuperar precio del HTML")
+                                error_count += 1
+                                continue
+
+                        _logger.log(f"  Precio encontrado: {price_str}")
+
+                        wl_data = {
+                            "price": f"{new_price:.2f}",
+                            "source": "cardmarket",
+                            "url": base_url,
+                        }
+                        try:
+                            r = api_post(f"wishlist-items/{item_id}/prices", wl_data)
+                            if r:
+                                saved_count += 1
+                                _logger.log(f"  Guardado en wishlist item {item_id}")
+                        except Exception as e:
+                            error_count += 1
+                            _logger.log(f"  Error al guardar en wishlist: {e}")
+                    else:
+                        error_count += 1
+                        _logger.log(f"  Precio no encontrado")
+
+                    if idx < total:
+                        delay = random.uniform(DELAY_MIN, DELAY_MAX)
+                        _logger.log(f"  Pausa {delay:.1f} s...")
+                        await asyncio.sleep(delay)
+                except Exception as e:
+                    error_count += 1
+                    _logger.log(f"  Error en enlace: {e}")
+                    continue
+
+        await context.close()
+
+    _logger.log(f"\n  {SEP}")
+    _logger.log(f"  Wishlist items:  {total}")
+    _logger.log(f"  Scrapeados:      {scraped_count}")
+    _logger.log(f"  Guardados:       {saved_count}")
+    _logger.log(f"  Errores:         {error_count}")
+    _logger.log(f"  {SEP}\n")
+
+
+async def _setup_browser(pw, profile_dir, exe_path):
+    if profile_dir:
+        browser_name = "Brave" if "Brave" in profile_dir or (exe_path and "brave" in exe_path.lower()) else "Chrome"
+        _logger.log(f"\n  Usando perfil real de {browser_name}: {profile_dir}")
+        _logger.log(f"  Asegurate de tener {browser_name} CERRADO antes de continuar.\n")
+        launch_kwargs = dict(
+            user_data_dir=profile_dir,
+            headless=HEADLESS,
+            slow_mo=80,
+            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
+            no_viewport=True,
+            locale="es-ES",
+        )
+        if exe_path:
+            launch_kwargs["executable_path"] = exe_path
+        else:
+            launch_kwargs["channel"] = "chrome"
+        context = await pw.chromium.launch_persistent_context(**launch_kwargs)
+        page = await context.new_page()
+    else:
+        _logger.log("\n  Brave/Chrome no encontrado. Usando Chromium sin perfil.\n")
+        browser = await pw.chromium.launch(
+            headless=HEADLESS,
+            slow_mo=80,
+            args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            locale="es-ES",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+    return context, page
+
+
+async def _check_history_skip(history_endpoint, filter_params, skip_threshold, price_minutes):
+    global _logger
+    history_records = api_get_all(history_endpoint, filter_params)
+    prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=price_minutes)
+    prev_date_str = (prev or {}).get("recorded_at", "")
+    if prev and prev_date_str:
+        try:
+            prev_dt = datetime.fromisoformat(prev_date_str)
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            if prev_dt >= cutoff:
+                _logger.log(f"  Ya tiene precio dentro del margen de {price_minutes} minuto(s) ({prev_date_str}), saltando")
+                return True
+        except ValueError:
+            pass
+
+    if prev and skip_threshold is not None:
+        prev_price_val = float(prev["price"])
+        if prev_price_val < skip_threshold:
+            _logger.log(f"  Precio previo ({prev_price_val:.2f}) < umbral ({skip_threshold:.2f}), saltando")
+            return True
+
+    return False
+
+
+async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishlist_minutes, price_minutes=None):
+    global _logger
+    prices = api_get(f"wishlist-items/{wishlist_item_id}/prices?limit=1")
+    prev = None
+    if prices:
+        items_list = prices if isinstance(prices, list) else prices.get("items", [])
+        if items_list:
+            prev = items_list[0]
+
+    minutes = wishlist_minutes if wishlist_minutes is not None else (price_minutes or 10080)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    prev_date_str = (prev or {}).get("recorded_at", "")
+    if prev and prev_date_str:
+        try:
+            prev_dt = datetime.fromisoformat(prev_date_str)
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            if prev_dt >= cutoff:
+                _logger.log(f"  Ya tiene precio dentro del margen de {minutes} minuto(s) ({prev_date_str}), saltando")
+                return True
+        except ValueError:
+            pass
+
+    return False
+
+
+async def _save_inventory_price(inv_id, tracking_id, price_str, page):
+    global _logger
+    if not price_str or price_str == "NO_ENCONTRADO":
+        _logger.log(f"  Precio no encontrado")
+        return None
+
+    try:
+        new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+    except ValueError:
+        _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
+        html = await page.content()
+        fallback = extract_price_from_html(html)
+        if fallback:
+            price_str = fallback
+            new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+            _logger.log(f"  Precio recuperado del HTML: {price_str}")
+        else:
+            _logger.log(f"  No se pudo recuperar precio del HTML")
+            return None
+
+    _logger.log(f"  Precio encontrado: {price_str}")
+
+    history_records = api_get_all("inventory-price-history", {
+        "inventory_id": inv_id,
+        "product_price_tracking_id": tracking_id,
+    })
+    prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
+
+    if prev is None:
+        min_price = new_price
+        max_price = new_price
+        min_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        max_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    else:
+        prev_price = float(prev["price"])
+        prev_min = float(prev["min_price"]) if prev.get("min_price") else prev_price
+        prev_max = float(prev["max_price"]) if prev.get("max_price") else prev_price
+
+        min_price = min(new_price, prev_min, prev_price)
+        max_price = max(new_price, prev_max, prev_price)
+
+        min_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                    if min_price != prev_min
+                    else prev.get("min_price_recorded_at"))
+        max_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                    if max_price != prev_max
+                    else prev.get("max_price_recorded_at"))
+
+    post_data = {
+        "inventory_id": inv_id,
+        "product_price_tracking_id": tracking_id,
+        "price": f"{new_price:.2f}",
+        "min_price": f"{min_price:.2f}",
+        "max_price": f"{max_price:.2f}",
+        "min_price_recorded_at": min_date,
+        "max_price_recorded_at": max_date,
+    }
+    try:
+        result = api_post("inventory-price-history", post_data)
+        _logger.log(f"  Guardado en inventory_price_history (id={result.get('id', '?')})")
+        return result
+    except Exception as e:
+        _logger.log(f"  Error al guardar: {e}")
+        return None
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\n  Interrumpido")
         sys.exit(1)
