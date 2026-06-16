@@ -561,7 +561,6 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
                         wl_data = {
                             "price": f"{new_price:.2f}",
                             "source": "cardmarket",
-                            "url": base_url,
                         }
                         try:
                             r = api_post(f"wishlist-items/{item_id}/prices", wl_data)
@@ -638,13 +637,13 @@ async def _check_history_skip(history_endpoint, filter_params, skip_threshold, p
     history_records = api_get_all(history_endpoint, filter_params)
     prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
 
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=price_minutes)
+    cutoff = datetime.now() - timedelta(minutes=price_minutes)
     prev_date_str = (prev or {}).get("recorded_at", "")
     if prev and prev_date_str:
         try:
             prev_dt = datetime.fromisoformat(prev_date_str)
-            if prev_dt.tzinfo is None:
-                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            if prev_dt.tzinfo is not None:
+                prev_dt = prev_dt.replace(tzinfo=None)
             if prev_dt >= cutoff:
                 _logger.log(f"  Ya tiene precio dentro del margen de {price_minutes} minuto(s) ({prev_date_str}), saltando")
                 return True
@@ -670,13 +669,13 @@ async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishli
             prev = items_list[0]
 
     minutes = wishlist_minutes if wishlist_minutes is not None else (price_minutes or 10080)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    cutoff = datetime.now() - timedelta(minutes=minutes)
     prev_date_str = (prev or {}).get("recorded_at", "")
     if prev and prev_date_str:
         try:
             prev_dt = datetime.fromisoformat(prev_date_str)
-            if prev_dt.tzinfo is None:
-                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            if prev_dt.tzinfo is not None:
+                prev_dt = prev_dt.replace(tzinfo=None)
             if prev_dt >= cutoff:
                 _logger.log(f"  Ya tiene precio dentro del margen de {minutes} minuto(s) ({prev_date_str}), saltando")
                 return True
@@ -714,13 +713,18 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, page):
     })
     prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
 
+    if prev is not None:
+        prev_price = float(prev["price"])
+        if abs(new_price - prev_price) < 0.001:
+            _logger.log(f"  Precio sin cambios ({new_price}), se omite guardado")
+            return prev
+
     if prev is None:
         min_price = new_price
         max_price = new_price
         min_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         max_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     else:
-        prev_price = float(prev["price"])
         prev_min = float(prev["min_price"]) if prev.get("min_price") else prev_price
         prev_max = float(prev["max_price"]) if prev.get("max_price") else prev_price
 
