@@ -211,7 +211,7 @@ def get_existing_collections(collections, card_type_id):
 
     for item in collections:
         card_type = item.get("card_type") or {}
-        if card_type.get("id") == card_type_id:
+        if card_type.get("id") == card_type_id and not item.get("is_manual"):
             by_code[item["code"]] = item
 
     return by_code

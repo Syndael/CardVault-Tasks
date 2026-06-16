@@ -300,10 +300,10 @@ def sync():
         return
 
     all_collections = api_get_all("collections", {"per_page": 200})
-    skip_codes = {c["code"] for c in all_collections if c.get("force_url")}
-    if skip_codes:
+    skip_ids = {c["id"] for c in all_collections if c.get("force_url")}
+    if skip_ids:
         before = len(pending)
-        pending = [p for p in pending if p["collection_code"] not in skip_codes]
+        pending = [p for p in pending if p["collection_id"] not in skip_ids]
         _logger.log(f"  Skip {before - len(pending)} cards from force_url collections\n")
 
     pending_ids = [p["product_id"] for p in pending]

@@ -363,7 +363,7 @@ def main():
 
     # --- Wishlist ---
     _logger.log("Obteniendo wishlist items...")
-    asyncio.run(process_wishlist(product_tracking, wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD))
+    asyncio.run(process_wishlist(product_tracking, wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD, languages, conditions))
 
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
@@ -463,7 +463,7 @@ async def process_inventory(items_to_check, product_tracking, languages, conditi
     _logger.log(f"  {SEP}\n")
 
 
-async def process_wishlist(product_tracking, wishlist_minutes, price_minutes):
+async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, languages, conditions):
     global _logger
     _logger.log("Obteniendo wishlist items activos...")
     wishlist_items = api_get_all("wishlist-items")
@@ -500,13 +500,36 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes):
                 _logger.log(f"\n[{idx}/{total}] wish#{item_id} {product_name or product_number}: sin tracking URL, saltando")
                 continue
 
+            wi_lang_id = wi.get("language_id")
+            wi_cond_id = wi.get("condition_id")
+
             for tr in tracking_list:
                 try:
                     base_url = tr.get("url", "").strip()
                     if not base_url:
                         continue
 
+                    price_source = tr.get("price_source") or {}
+                    lang_param = price_source.get("language_param")
+                    cond_param = price_source.get("condition_param")
+
+                    lang_code = None
+                    if lang_param and wi_lang_id and wi_lang_id in languages:
+                        lang_code = languages[wi_lang_id].get("cardmarket_code")
+
+                    cond_code = None
+                    if cond_param and wi_cond_id and wi_cond_id in conditions:
+                        cond_code = conditions[wi_cond_id].get("cardmarket_code")
+
+                    params = {}
+                    if lang_param and lang_code:
+                        params[lang_param] = lang_code
+                    if cond_param and cond_code:
+                        params[cond_param] = cond_code
+
                     full_url = base_url
+                    if params:
+                        full_url += "?" + urllib.parse.urlencode(params)
 
                     product_info = f"wish#{item_id} {product_name or product_number[:50]}"
                     _logger.log(f"\n[{idx}/{total}] {product_info}")
