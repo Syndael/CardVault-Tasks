@@ -176,9 +176,9 @@ def get_lang_maps(languages):
 
 def get_existing_images(files, product_id):
     return {
-        f["language_id"]
+        (f.get("language") or {}).get("id")
         for f in files
-        if f.get("product_id") == product_id
+        if (f.get("product") or {}).get("id") == product_id
     }
 
 

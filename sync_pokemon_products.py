@@ -211,9 +211,9 @@ def get_lang_maps(languages):
 
 def get_existing_images(files, product_id):
     return {
-        f["language_id"]
+        (f.get("language") or {}).get("id")
         for f in files
-        if f.get("product_id") == product_id
+        if (f.get("product") or {}).get("id") == product_id
     }
 
 
@@ -294,10 +294,6 @@ def sync():
         "per_page": 200
     })
     _logger.log(f"  {len(pending)} pending cards\n")
-    if not pending:
-        _logger.log("  No pending cards")
-        finalize_log(_logger, "pokemon_products", _API_ROOT, api_request)
-        return
 
     all_collections = api_get_all("collections", {"per_page": 200})
     skip_ids = {c["id"] for c in all_collections if c.get("force_url")}
@@ -305,6 +301,66 @@ def sync():
         before = len(pending)
         pending = [p for p in pending if p["collection_id"] not in skip_ids]
         _logger.log(f"  Skip {before - len(pending)} cards from force_url collections\n")
+
+    force_dl_cols = [c for c in all_collections if c.get("force_download") and not c.get("force_url") and not c.get("is_manual")]
+    if force_dl_cols:
+        added = 0
+        existing_ids = {p["product_id"] for p in pending}
+        for col in force_dl_cols:
+            col_id = col["id"]
+            col_code = col["code"]
+            _logger.log(f"\n  Force-download collection {col_code}...")
+
+            set_data = fetch_json(f"{api_base}/en/sets/{col_code}")
+            if not set_data or not set_data.get("cards"):
+                _logger.log(f"  Cannot fetch set {col_code} from TCGDex, skipping")
+                continue
+            tcgdex_cards = set_data["cards"]
+
+            existing_products = api_get_all("product-catalog", {
+                "product_type_id": card_type_id,
+                "collection_code": col_code,
+                "per_page": 200
+            })
+            existing_by_number = {p["product_number"]: p for p in existing_products}
+
+            created = 0
+            for card in tcgdex_cards:
+                card_number = card.get("localId", "")
+                if not card_number:
+                    continue
+                if card_number in existing_by_number:
+                    continue
+                result = api_request("POST", "products", {
+                    "collection_id": col_id,
+                    "product_type_id": card_type_id,
+                    "product_number": card_number
+                })
+                if result:
+                    created += 1
+                    new_prod = api_get("product-catalog", {
+                        "product_type_id": card_type_id,
+                        "collection_code": col_code,
+                        "product_number": card_number,
+                        "per_page": 1
+                    })
+                    if new_prod and new_prod.get("items"):
+                        pending.append(new_prod["items"][0])
+                        existing_ids.add(new_prod["items"][0]["product_id"])
+                        existing_by_number[card_number] = new_prod["items"][0]
+                    _logger.log(f"    Created {col_code}-{card_number} ({card.get('name', '?')})")
+
+            col_added = 0
+            for cp in existing_products:
+                if cp["product_id"] not in existing_ids:
+                    pending.append(cp)
+                    existing_ids.add(cp["product_id"])
+                    col_added += 1
+
+            _logger.log(f"  Collection {col_code}: {created} created, {col_added} existing added")
+            added += created + col_added
+        if added:
+            _logger.log(f"  Total added from force-download collections: {added}\n")
 
     pending_ids = [p["product_id"] for p in pending]
     all_files = api_get_all("files", {"per_page": 500})
@@ -445,6 +501,11 @@ def sync():
             stats["not_found"] += 1
 
         time.sleep(0.1)
+
+    if force_dl_cols:
+        for col in force_dl_cols:
+            api_request("PATCH", f"collections/{col['id']}", {"force_download": False})
+            _logger.log(f"  Cleared force_download for collection {col['code']}")
 
     _logger.log(f"\n{SEP}")
     _logger.log(f"  Cards OK: {stats['cards_ok']}")
