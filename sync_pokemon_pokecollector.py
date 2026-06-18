@@ -205,14 +205,14 @@ async def scrape_collection_cards(page, url):
 
     html = await page.content()
 
-    links = re.findall(r'<a\s+href="(/[^"]+-Card-\d+)"', html)
-    if not links:
-        links = re.findall(r'<a\s+href="(/[^"]+)"[^>]*>', html)
+    links = re.findall(r'<a\s+href="(/[^"]+)"', html)
+    # Filter to only card-like links (ending with -N)
+    links = [l for l in links if re.search(r'-\d+$', l)]
 
     cards = []
     seen = set()
     for href in links:
-        m = re.search(r'-Card-(\d+)$', href)
+        m = re.search(r'-(\d+)$', href)
         if not m:
             continue
         card_num = m.group(1)
@@ -223,9 +223,11 @@ async def scrape_collection_cards(page, url):
         full_url = f"https://jp.pokellector.com{href}"
         # Derive English name from URL: /expansion/Card-Name-Card-N -> "Card Name"
         name_match = re.search(r'/([^/]+?)-Card-\d+$', href)
-        en_name = name_match.group(1).replace("-", " ") if name_match else ""
-        # Title-case the name
-        en_name = en_name.title()
+        if not name_match:
+            parts = href.rstrip('/').split('/')
+            last_seg = parts[-1] if parts else ""
+            name_match = re.match(r'^(.+?)-[A-Za-z]+-\d+$', last_seg) if last_seg else None
+        en_name = name_match.group(1).replace("-", " ").title() if name_match else ""
 
         cards.append({
             "number": card_num,
