@@ -716,7 +716,14 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, page):
     if prev is not None:
         prev_price = float(prev["price"])
         if abs(new_price - prev_price) < 0.001:
-            _logger.log(f"  Precio sin cambios ({new_price}), se omite guardado")
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            try:
+                result = api_request("PATCH", f"inventory-price-history/{prev['id']}", {"recorded_at": now_str})
+                if result:
+                    _logger.log(f"  Precio sin cambios, actualizado timestamp (id={prev['id']})")
+                    return result
+            except Exception as e:
+                _logger.log(f"  Error al actualizar timestamp: {e}")
             return prev
 
     if prev is None:
