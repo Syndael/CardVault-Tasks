@@ -341,13 +341,11 @@ def main():
         _logger.log(f"  Minutos salto wishlist: {wishlist_minutes_threshold}")
 
     # --- Inventory ---
-    _logger.log("Obteniendo idiomas...")
-    languages = {lang["id"]: lang for lang in api_get_all("languages")}
-    _logger.log("Obteniendo condiciones...")
-    conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
-
-    _logger.log("Obteniendo inventario...")
-    inventory_items = api_get_all("inventory", {"all": "1", "per_page": 100})
+    _logger.log("Obteniendo inventario (solo productos con tracking)...")
+    inventory_items = api_get_all("inventory", {
+        "product_ids": ",".join(str(pid) for pid in product_tracking.keys()),
+        "per_page": 500
+    })
 
     items_to_check = []
     for item in inventory_items:
@@ -358,21 +356,58 @@ def main():
 
     _logger.log(f"  {len(items_to_check)} items de inventario con tracking de CardMarket")
 
-    if items_to_check:
-        asyncio.run(process_inventory(items_to_check, product_tracking, languages, conditions, skip_threshold, PRICE_MINUTES_THRESHOLD))
+    # Pre-filter: descartar items con precio reciente o por debajo del umbral
+    scrape_candidates = []
+    for item in items_to_check:
+        product = item.get("product") or {}
+        prod_id = product.get("id")
+        inv_id = item["id"]
+        translations = product.get("translations") or []
+        prod_name = (translations[0] or {}).get("name", "") if translations else ""
+        for tr in product_tracking[prod_id]:
+            if not tr.get("url", "").strip():
+                continue
+            skip = _check_history_skip_sync("inventory-price-history", {
+                "inventory_id": inv_id,
+                "product_price_tracking_id": tr["id"],
+            }, skip_threshold, PRICE_MINUTES_THRESHOLD)
+            if skip:
+                _logger.log(f"  inv#{inv_id} {prod_name[:50]}: saltando (precio reciente o bajo umbral)")
+                continue
+            scrape_candidates.append((item, tr, prod_name))
+
+    _logger.log(f"  {len(scrape_candidates)} requieren scraping")
+
+    languages = {}
+    conditions = {}
+
+    if scrape_candidates:
+        _logger.log("Obteniendo idiomas...")
+        languages = {lang["id"]: lang for lang in api_get_all("languages")}
+        _logger.log("Obteniendo condiciones...")
+        conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
+        asyncio.run(process_inventory(scrape_candidates, languages, conditions))
+    else:
+        _logger.log("No hay items de inventario que requieran scraping")
 
     # --- Wishlist ---
+    if not languages or not conditions:
+        _logger.log("Obteniendo idiomas...")
+        languages = {lang["id"]: lang for lang in api_get_all("languages")}
+        _logger.log("Obteniendo condiciones...")
+        conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
+
     _logger.log("Obteniendo wishlist items...")
     asyncio.run(process_wishlist(product_tracking, wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD, languages, conditions))
 
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
 
-async def process_inventory(items_to_check, product_tracking, languages, conditions, skip_threshold, price_minutes):
+async def process_inventory(scrape_candidates, languages, conditions):
     global _logger
     profile_dir, exe_path = find_browser_profile()
     SEP = "=" * 58
-    total = len(items_to_check)
+    total = len(scrape_candidates)
 
     async with async_playwright() as pw:
         context, page = await _setup_browser(pw, profile_dir, exe_path)
@@ -385,73 +420,59 @@ async def process_inventory(items_to_check, product_tracking, languages, conditi
         saved_count = 0
         error_count = 0
 
-        for idx, item in enumerate(items_to_check, 1):
-            product = item.get("product") or {}
-            prod_id = product.get("id")
-            inv_id = item["id"]
-            inv_lang = item.get("language") or {}
-            inv_cond = item.get("condition") or {}
+        for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
+            try:
+                inv_id = item["id"]
+                inv_lang = item.get("language") or {}
+                inv_cond = item.get("condition") or {}
 
-            translations = product.get("translations") or []
-            prod_name = (translations[0] or {}).get("name", "") if translations else ""
-
-            for tr in product_tracking[prod_id]:
-                try:
-                    base_url = tr.get("url", "").strip()
-                    if not base_url:
-                        continue
-
-                    price_source = tr.get("price_source") or {}
-                    lang_param = price_source.get("language_param")
-                    cond_param = price_source.get("condition_param")
-
-                    lang_code = None
-                    lang_id = inv_lang.get("id")
-                    if lang_id and lang_id in languages:
-                        lang_code = languages[lang_id].get("cardmarket_code")
-
-                    cond_code = None
-                    cond_id = inv_cond.get("id")
-                    if cond_id and cond_id in conditions:
-                        cond_code = conditions[cond_id].get("cardmarket_code")
-
-                    params = {}
-                    if lang_param and lang_code:
-                        params[lang_param] = lang_code
-                    if cond_param and cond_code:
-                        params[cond_param] = cond_code
-
-                    full_url = base_url
-                    if params:
-                        full_url += "?" + urllib.parse.urlencode(params)
-
-                    product_info = f"inv#{inv_id} {prod_name[:50]}"
-                    _logger.log(f"\n[{idx}/{total}] {product_info}")
-                    _logger.log(f"  URL: {full_url}")
-
-                    skip = await _check_history_skip("inventory-price-history", {
-                        "inventory_id": inv_id,
-                        "product_price_tracking_id": tr["id"],
-                    }, skip_threshold, price_minutes)
-                    if skip:
-                        continue
-
-                    price_str = await scrape_price(page, full_url)
-                    result = await _save_inventory_price(inv_id, tr["id"], price_str, page)
-                    if result:
-                        scraped_count += 1
-                        saved_count += 1
-                    else:
-                        error_count += 1
-
-                    if idx < total:
-                        delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                        _logger.log(f"  Pausa {delay:.1f} s...")
-                        await asyncio.sleep(delay)
-                except Exception as e:
-                    error_count += 1
-                    _logger.log(f"  Error en enlace: {e}")
+                base_url = tr.get("url", "").strip()
+                if not base_url:
                     continue
+
+                price_source = tr.get("price_source") or {}
+                lang_param = price_source.get("language_param")
+                cond_param = price_source.get("condition_param")
+
+                lang_code = None
+                lang_id = inv_lang.get("id")
+                if lang_id and lang_id in languages:
+                    lang_code = languages[lang_id].get("cardmarket_code")
+
+                cond_code = None
+                cond_id = inv_cond.get("id")
+                if cond_id and cond_id in conditions:
+                    cond_code = conditions[cond_id].get("cardmarket_code")
+
+                params = {}
+                if lang_param and lang_code:
+                    params[lang_param] = lang_code
+                if cond_param and cond_code:
+                    params[cond_param] = cond_code
+
+                full_url = base_url
+                if params:
+                    full_url += "?" + urllib.parse.urlencode(params)
+
+                _logger.log(f"\n[{idx}/{total}] inv#{inv_id} {prod_name[:50]}")
+                _logger.log(f"  URL: {full_url}")
+
+                price_str = await scrape_price(page, full_url)
+                result = await _save_inventory_price(inv_id, tr["id"], price_str, page)
+                if result:
+                    scraped_count += 1
+                    saved_count += 1
+                else:
+                    error_count += 1
+
+                if idx < total:
+                    delay = random.uniform(DELAY_MIN, DELAY_MAX)
+                    _logger.log(f"  Pausa {delay:.1f} s...")
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                error_count += 1
+                _logger.log(f"  Error en enlace: {e}")
+                continue
 
         await context.close()
 
@@ -608,8 +629,6 @@ async def _setup_browser(pw, profile_dir, exe_path):
         )
         if exe_path:
             launch_kwargs["executable_path"] = exe_path
-        else:
-            launch_kwargs["channel"] = "chrome"
         context = await pw.chromium.launch_persistent_context(**launch_kwargs)
         page = await context.new_page()
     else:
@@ -632,7 +651,7 @@ async def _setup_browser(pw, profile_dir, exe_path):
     return context, page
 
 
-async def _check_history_skip(history_endpoint, filter_params, skip_threshold, price_minutes):
+def _check_history_skip_sync(history_endpoint, filter_params, skip_threshold, price_minutes):
     global _logger
     history_records = api_get_all(history_endpoint, filter_params)
     prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
@@ -645,16 +664,17 @@ async def _check_history_skip(history_endpoint, filter_params, skip_threshold, p
             if prev_dt.tzinfo is not None:
                 prev_dt = prev_dt.replace(tzinfo=None)
             if prev_dt >= cutoff:
-                _logger.log(f"  Ya tiene precio dentro del margen de {price_minutes} minuto(s) ({prev_date_str}), saltando")
                 return True
         except ValueError:
             pass
 
     if prev and skip_threshold is not None:
-        prev_price_val = float(prev["price"])
-        if prev_price_val < skip_threshold:
-            _logger.log(f"  Precio previo ({prev_price_val:.2f}) < umbral ({skip_threshold:.2f}), saltando")
-            return True
+        try:
+            prev_price_val = float(prev["price"])
+            if prev_price_val < skip_threshold:
+                return True
+        except (ValueError, TypeError):
+            pass
 
     return False
 

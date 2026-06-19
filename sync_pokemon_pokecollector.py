@@ -353,6 +353,17 @@ async def main():
     _logger.log(f"  Card type ID: {card_type_id}")
     _logger.log(f"  Image file type ID: {image_file_type_id}")
 
+    product_format_id = None
+    for t in types_list:
+        if t.get("type") == "product_format" and t.get("name") == "carta":
+            product_format_id = t["id"]
+            break
+    if not product_format_id:
+        _logger.log("  ERROR: product format 'carta' not found in types")
+        finalize_log(_logger, "pokemon_pokecollector", _API_ROOT, api_request)
+        sys.exit(1)
+    _logger.log(f"  Product format ID (carta): {product_format_id}")
+
     _logger.log("\nObteniendo idiomas...")
     languages_list = api_get_all("languages")
     lang_en_id = None
@@ -390,7 +401,6 @@ async def main():
                 no_viewport=True,
                 locale="es-ES",
                 executable_path=exe_path if exe_path else None,
-                channel=None if exe_path else "chrome",
             )
             page = await context.new_page()
         else:
@@ -493,6 +503,7 @@ async def main():
                         result = api_request("POST", "products", {
                             "collection_id": col_id,
                             "product_type_id": card_type_id,
+                            "product_format_id": product_format_id,
                             "product_number": card_num,
                             "force_download": True,
                             "is_manual": True,

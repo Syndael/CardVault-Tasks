@@ -283,6 +283,14 @@ def sync():
     if not image_file_type_id:
         raise RuntimeError("file type 'image' not found in types")
 
+    product_format_id = None
+    for t in types:
+        if t.get("type") == "product_format" and t.get("name") == "carta":
+            product_format_id = t["id"]
+            break
+    if not product_format_id:
+        raise RuntimeError("product format 'carta' not found in types")
+
     tcgdex_codes = [l.get("tcgdex_language_code") for l in languages if l.get("tcgdex_language_code")]
     _logger.log(f"\n  Languages trad: {', '.join(tcgdex_codes)}")
     _logger.log(f"  Languages img: {', '.join(image_tcgdex_codes)}")
@@ -334,6 +342,7 @@ def sync():
                 result = api_request("POST", "products", {
                     "collection_id": col_id,
                     "product_type_id": card_type_id,
+                    "product_format_id": product_format_id,
                     "product_number": card_number
                 })
                 if result:

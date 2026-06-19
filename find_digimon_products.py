@@ -413,10 +413,11 @@ def find_missing_alt_arts(set_code, standard_numbers, existing_numbers, card_num
     return sorted(found)
 
 
-def _create_product(set_code, num, collection, card_type_id):
+def _create_product(set_code, num, collection, card_type_id, product_format_id):
     result = api_post("products", {
         "collection_id": collection["id"],
         "product_type_id": card_type_id,
+        "product_format_id": product_format_id,
         "product_number": num,
     })
     if not result:
@@ -438,7 +439,7 @@ def _try_register_image(product_id, card_id, set_code, lang_id,
 
 
 def _process_standard_card(params):
-    (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
+    (set_code, num, collection, card_type_id, product_format_id, en_lang_id, jp_lang_id,
      image_file_type_id, files_path, img_path_pattern, card_type,
      api_base, existing_nums, existing_images_by_product, stats) = params
 
@@ -449,7 +450,7 @@ def _process_standard_card(params):
         return None
 
     card_id = f"{set_code}-{num}"
-    product_id = _create_product(set_code, num, collection, card_type_id)
+    product_id = _create_product(set_code, num, collection, card_type_id, product_format_id)
     if not product_id:
         return None
 
@@ -501,14 +502,14 @@ def _process_jp_image(params):
 
 
 def _process_alt_art(params):
-    (set_code, alt_num, collection, card_type_id, en_lang_id, jp_lang_id,
+    (set_code, alt_num, collection, card_type_id, product_format_id, en_lang_id, jp_lang_id,
      image_file_type_id, files_path, img_path_pattern, card_type,
      existing_nums, existing_images_by_product, stats) = params
 
     card_id = f"{set_code}-{alt_num}"
     results = []
 
-    en_pid = _create_product(set_code, alt_num, collection, card_type_id)
+    en_pid = _create_product(set_code, alt_num, collection, card_type_id, product_format_id)
     if en_pid:
         with _stats_lock:
             existing_nums.add(alt_num)
@@ -532,7 +533,7 @@ def _process_alt_art(params):
         if jp_lang_id:
             jp_num = f"{alt_num}JP"
             if jp_num not in existing_nums and check_image_exists_jp(card_id):
-                jp_pid = _create_product(set_code, jp_num, collection, card_type_id)
+                jp_pid = _create_product(set_code, jp_num, collection, card_type_id, product_format_id)
                 if jp_pid:
                     with _stats_lock:
                         existing_nums.add(jp_num)
@@ -603,6 +604,14 @@ def sync():
             break
     if not image_file_type_id:
         raise RuntimeError("file type 'image' not found in types")
+
+    product_format_id = None
+    for t in types:
+        if t.get("type") == "product_format" and t.get("name") == "carta":
+            product_format_id = t["id"]
+            break
+    if not product_format_id:
+        raise RuntimeError("product format 'carta' not found in types")
 
     collections = api_get_all("collections")
     digimon_collections = {}
@@ -707,16 +716,16 @@ def sync():
                 futures = {
                     executor.submit(
                         _process_standard_card,
-                        (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
+                        (set_code, num, collection, card_type_id, product_format_id, en_lang_id, jp_lang_id,
                          image_file_type_id, files_path, img_path_pattern, card_type,
                          api_base, existing_nums, existing_images_by_product, stats)
                     ): num
-                    for num in new_cards
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    msg = future.result()
-                    if msg:
-                        _logger.log(msg)
+                for num in new_cards
+            }
+            for future in concurrent.futures.as_completed(futures):
+                msg = future.result()
+                if msg:
+                    _logger.log(msg)
 
             created = sum(1 for num in new_cards if num in existing_nums)
             if created:
@@ -799,7 +808,7 @@ def sync():
                 futures = {
                     executor.submit(
                         _process_alt_art,
-                        (set_code, alt_num, collection, card_type_id, en_lang_id, jp_lang_id,
+                        (set_code, alt_num, collection, card_type_id, product_format_id, en_lang_id, jp_lang_id,
                          image_file_type_id, files_path, img_path_pattern, card_type,
                          existing_nums, existing_images_by_product, stats)
                     ): alt_num
@@ -851,12 +860,12 @@ def sync():
         _logger.log(f"  {set_code}: checking {len(missing)} gaps in range 1..{max_num}...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = {
-                executor.submit(
-                    _process_standard_card,
-                    (set_code, num, collection, card_type_id, en_lang_id, jp_lang_id,
-                     image_file_type_id, files_path, img_path_pattern, card_type,
-                     api_base, existing_nums, existing_images_by_product, stats)
-                ): num
+                    executor.submit(
+                        _process_standard_card,
+                        (set_code, num, collection, card_type_id, product_format_id, en_lang_id, jp_lang_id,
+                         image_file_type_id, files_path, img_path_pattern, card_type,
+                         api_base, existing_nums, existing_images_by_product, stats)
+                    ): num
                 for num in missing
             }
             for future in concurrent.futures.as_completed(futures):

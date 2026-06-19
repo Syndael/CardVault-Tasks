@@ -227,32 +227,72 @@ def run_execution(execution):
         ]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=TASK_TIMEOUT)
 
+        POLL_INTERVAL = 5
+        deadline = time.time() + TASK_TIMEOUT
+        timed_out = False
+        cancelled = False
+
+        while time.time() < deadline:
+            for t in threads:
+                t.join(timeout=POLL_INTERVAL)
+            if not any(t.is_alive() for t in threads):
+                break
+
+            current = api_get(f"task-executions/{exec_id}")
+            if current and current.get("status") == "cancelled":
+                log.info("Execution %d cancelled by user", exec_id)
+                cancelled = True
+                break
+        else:
+            timed_out = True
+
+        if cancelled or timed_out:
+            process.kill()
         process.wait(timeout=10)
 
         output = "".join(stdout_lines)
         if stderr_lines:
             output += "\n--- stderr ---\n" + "".join(stderr_lines)
 
-        if process.returncode == 0:
-            status = "completed"
+        if cancelled:
+            output += "\n\n--- Ejecuci\u00f3n cancelada por el usuario ---"
+            update_execution(exec_id, "cancelled", finished_at=dt_to_str(datetime.now()), output=output)
+            log.info("'%s' cancelled", task_name)
+        elif timed_out:
+            update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()),
+                             output=output + f"\n\n--- Timeout after {TASK_TIMEOUT}s ---")
+            log.error("'%s' timed out", task_name)
+        elif process.returncode == 0:
             log.info("'%s' completed (exit %d)", task_name, process.returncode)
+            update_execution(exec_id, "completed", finished_at=dt_to_str(datetime.now()), output=output)
         else:
-            status = "error"
             log.warning("'%s' failed (exit %d)", task_name, process.returncode)
+            update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=output)
 
-        update_execution(exec_id, status, finished_at=dt_to_str(datetime.now()), output=output)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-        update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()),
-                         output=f"Timeout after {TASK_TIMEOUT}s")
-        log.error("'%s' timed out", task_name)
     except Exception as e:
         update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=str(e))
         log.exception("'%s' raised exception", task_name)
+
+
+_lock = threading.Lock()
+_running_task_ids: dict[int, int] = {}  # scheduled_task_id -> execution_id
+_running_execs: dict[int, threading.Thread] = {}  # execution_id -> Thread
+
+
+def _start_execution(execution):
+    try:
+        current = api_get(f"task-executions/{execution['id']}")
+        if current and current.get("status") in ("cancelled",):
+            log.info("Execution %d already cancelled, skipping", execution["id"])
+            return
+        run_execution(execution)
+    finally:
+        with _lock:
+            exec_id = execution["id"]
+            task_id = execution.get("scheduled_task_id")
+            _running_task_ids.pop(task_id, None)
+            _running_execs.pop(exec_id, None)
 
 
 def main_loop(interval):
@@ -269,11 +309,26 @@ def main_loop(interval):
                     log.error("Error processing task '%s': %s", task.get("name"), e)
 
             pending = get_pending_executions()
-            for execution in pending:
-                try:
-                    run_execution(execution)
-                except Exception as e:
-                    log.error("Error running execution %d: %s", execution.get("id"), e)
+
+            with _lock:
+                for execution in pending:
+                    exec_id = execution["id"]
+                    task_id = execution.get("scheduled_task_id")
+
+                    if exec_id in _running_execs:
+                        continue
+                    if task_id in _running_task_ids:
+                        log.info("Skipping execution %d: '%s' already running",
+                                 exec_id, execution.get("scheduled_task", {}).get("name", task_id))
+                        continue
+                    if len(_running_execs) >= 2:
+                        log.info("Max concurrent executions reached, skipping remaining pending")
+                        break
+
+                    _running_task_ids[task_id] = exec_id
+                    t = threading.Thread(target=_start_execution, args=(execution,), daemon=True)
+                    _running_execs[exec_id] = t
+                    t.start()
 
         except Exception as e:
             log.exception("Unexpected error in main loop")
