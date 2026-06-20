@@ -120,7 +120,8 @@ def api_post(path, data):
 def api_get_all(path, params=None):
     page = 1
     items = []
-    merged = {**(params or {}), "page": page, "per_page": 100}
+    per_page = (params or {}).get("per_page", 100)
+    merged = {**(params or {}), "page": page, "per_page": per_page}
     while True:
         data = api_get(path, merged)
         if not data:
@@ -342,10 +343,17 @@ def main():
 
     # --- Inventory ---
     _logger.log("Obteniendo inventario (solo productos con tracking)...")
-    inventory_items = api_get_all("inventory", {
-        "product_ids": ",".join(str(pid) for pid in product_tracking.keys()),
-        "per_page": 500
-    })
+    inventory_items = []
+    all_pids = list(product_tracking.keys())
+    BATCH_SIZE = 200
+    for i in range(0, len(all_pids), BATCH_SIZE):
+        batch_pids = all_pids[i:i + BATCH_SIZE]
+        batch = api_get_all("inventory", {
+            "product_ids": ",".join(str(pid) for pid in batch_pids),
+            "per_page": 500
+        })
+        if batch:
+            inventory_items.extend(batch)
 
     items_to_check = []
     for item in inventory_items:
