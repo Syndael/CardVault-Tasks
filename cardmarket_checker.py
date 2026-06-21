@@ -350,7 +350,8 @@ def main():
         batch_pids = all_pids[i:i + BATCH_SIZE]
         batch = api_get_all("inventory", {
             "product_ids": ",".join(str(pid) for pid in batch_pids),
-            "per_page": 500
+            "per_page": 500,
+            "all": "1"
         })
         if batch:
             inventory_items.extend(batch)
@@ -378,7 +379,7 @@ def main():
             skip = _check_history_skip_sync("inventory-price-history", {
                 "inventory_id": inv_id,
                 "product_price_tracking_id": tr["id"],
-            }, skip_threshold, PRICE_MINUTES_THRESHOLD)
+            }, PRICE_MINUTES_THRESHOLD, skip_threshold)
             if skip:
                 _logger.log(f"  inv#{inv_id} {prod_name[:50]}: saltando (precio reciente o bajo umbral)")
                 continue
@@ -659,18 +660,18 @@ async def _setup_browser(pw, profile_dir, exe_path):
     return context, page
 
 
-def _check_history_skip_sync(history_endpoint, filter_params, skip_threshold, price_minutes):
+def _check_history_skip_sync(history_endpoint, filter_params, price_minutes, skip_threshold=None):
     global _logger
     history_records = api_get_all(history_endpoint, filter_params)
     prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
 
-    cutoff = datetime.now() - timedelta(minutes=price_minutes)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=price_minutes)
     prev_date_str = (prev or {}).get("recorded_at", "")
     if prev and prev_date_str:
         try:
             prev_dt = datetime.fromisoformat(prev_date_str)
-            if prev_dt.tzinfo is not None:
-                prev_dt = prev_dt.replace(tzinfo=None)
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
             if prev_dt >= cutoff:
                 return True
         except ValueError:
@@ -697,13 +698,13 @@ async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishli
             prev = items_list[0]
 
     minutes = wishlist_minutes if wishlist_minutes is not None else (price_minutes or 10080)
-    cutoff = datetime.now() - timedelta(minutes=minutes)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
     prev_date_str = (prev or {}).get("recorded_at", "")
     if prev and prev_date_str:
         try:
             prev_dt = datetime.fromisoformat(prev_date_str)
-            if prev_dt.tzinfo is not None:
-                prev_dt = prev_dt.replace(tzinfo=None)
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
             if prev_dt >= cutoff:
                 _logger.log(f"  Ya tiene precio dentro del margen de {minutes} minuto(s) ({prev_date_str}), saltando")
                 return True
