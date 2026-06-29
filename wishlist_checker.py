@@ -4,6 +4,7 @@ import os
 import smtplib
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -60,7 +61,11 @@ def _get_token():
 
 def api_request(method, path, data=None, timeout=15):
     clean_path = path.strip("/")
-    url = f"{API_BASE.rstrip('/')}/{clean_path}/"
+    if "?" in clean_path:
+        clean_path, qs = clean_path.split("?", 1)
+        url = f"{API_BASE.rstrip('/')}/{clean_path}/?{qs}"
+    else:
+        url = f"{API_BASE.rstrip('/')}/{clean_path}/"
     body = None
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -85,12 +90,31 @@ def api_request(method, path, data=None, timeout=15):
         return None
 
 
-def api_get(path):
+def api_get(path, params=None):
+    if params:
+        path = f"{path}?{urllib.parse.urlencode(params)}"
     return api_request("GET", path)
 
 
 def api_post(path, data):
     return api_request("POST", path, data)
+
+
+def api_get_all(path, params=None):
+    page = 1
+    items = []
+    per_page = (params or {}).get("per_page", 100)
+    merged = {**(params or {}), "page": page, "per_page": per_page}
+    while True:
+        data = api_get(path, merged)
+        if not data:
+            return items
+        items.extend(data.get("items", []))
+        pagination = data.get("pagination", {})
+        if not pagination.get("has_next"):
+            return items
+        page += 1
+        merged["page"] = page
 
 
 def _load_smtp_config():
@@ -139,11 +163,7 @@ def _send_email(to_addr, subject, body):
 def check_wishlist_items():
     log.info("Checking wishlist items for price alerts...")
 
-    response = api_get("wishlist-items")
-    if not response:
-        log.info("No wishlist items found")
-        return
-    items = response.get("items", [])
+    items = api_get_all("wishlist-items")
     if not items:
         log.info("No wishlist items found")
         return
