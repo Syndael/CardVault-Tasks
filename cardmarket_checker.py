@@ -366,7 +366,7 @@ def main():
     _logger.log(f"  {len(items_to_check)} items de inventario con tracking de CardMarket")
 
     # Pre-filter: descartar items con precio reciente o por debajo del umbral
-    scrape_candidates = []
+    candidate_meta = []
     for item in items_to_check:
         product = item.get("product") or {}
         prod_id = product.get("id")
@@ -376,14 +376,27 @@ def main():
         for tr in product_tracking[prod_id]:
             if not tr.get("url", "").strip():
                 continue
-            skip = _check_history_skip_sync("inventory-price-history", {
+            skip, prev = _check_history_skip_sync("inventory-price-history", {
                 "inventory_id": inv_id,
                 "product_price_tracking_id": tr["id"],
             }, PRICE_MINUTES_THRESHOLD, skip_threshold)
             if skip:
-                _logger.log(f"  inv#{inv_id} {prod_name[:50]}: saltando (precio reciente o bajo umbral)")
                 continue
-            scrape_candidates.append((item, tr, prod_name))
+            has_price = prev is not None
+            last_price = float(prev["price"]) if has_price else 0
+            last_date = prev.get("recorded_at", "") if has_price else ""
+            candidate_meta.append({
+                "item": item, "tr": tr, "prod_name": prod_name,
+                "has_price": has_price, "last_price": last_price, "last_date": last_date
+            })
+
+    # Ordenar: 1) sin precio, 2) precio más alto, 3) más tiempo sin actualizar
+    candidate_meta.sort(key=lambda c: (
+        0 if not c["has_price"] else 1,
+        -(c["last_price"] if c["has_price"] else 0),
+        c.get("last_date") or ""
+    ))
+    scrape_candidates = [(c["item"], c["tr"], c["prod_name"]) for c in candidate_meta]
 
     _logger.log(f"  {len(scrape_candidates)} requieren scraping")
 
@@ -428,6 +441,7 @@ async def process_inventory(scrape_candidates, languages, conditions):
         scraped_count = 0
         saved_count = 0
         error_count = 0
+        consecutive_no_price = 0
 
         for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
             try:
@@ -463,34 +477,38 @@ async def process_inventory(scrape_candidates, languages, conditions):
                 if params:
                     full_url += "?" + urllib.parse.urlencode(params)
 
-                _logger.log(f"\n[{idx}/{total}] inv#{inv_id} {prod_name[:50]}")
-                _logger.log(f"  URL: {full_url}")
-
                 price_str = await scrape_price(page, full_url)
                 result = await _save_inventory_price(inv_id, tr["id"], price_str, page)
                 if result:
                     scraped_count += 1
                     saved_count += 1
+                    consecutive_no_price = 0
+                    _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> {price_str}")
                 else:
                     error_count += 1
+                    consecutive_no_price += 1
+                    _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> SIN PRECIO")
+                    if consecutive_no_price >= 5:
+                        _logger.log(f"  {consecutive_no_price} productos sin precio seguidos. Posible bloqueo Cloudflare. Abortando.")
+                        await context.close()
+                        sys.exit(1)
 
                 if idx < total:
                     delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                    _logger.log(f"  Pausa {delay:.1f} s...")
                     await asyncio.sleep(delay)
             except Exception as e:
                 error_count += 1
-                _logger.log(f"  Error en enlace: {e}")
+                consecutive_no_price += 1
+                _logger.log(f"  inv#? {e}")
+                if consecutive_no_price >= 5:
+                    _logger.log(f"  {consecutive_no_price} errores seguidos. Abortando.")
+                    await context.close()
+                    sys.exit(1)
                 continue
 
         await context.close()
 
-    _logger.log(f"\n  {SEP}")
-    _logger.log(f"  Procesados:     {total}")
-    _logger.log(f"  Scrapeados:     {scraped_count}")
-    _logger.log(f"  Guardados:      {saved_count}")
-    _logger.log(f"  Errores:        {error_count}")
-    _logger.log(f"  {SEP}\n")
+    _logger.log(f"  Procesados: {total} | OK: {scraped_count} | Errores: {error_count}")
 
 
 async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, languages, conditions):
@@ -673,7 +691,7 @@ def _check_history_skip_sync(history_endpoint, filter_params, price_minutes, ski
             if prev_dt.tzinfo is None:
                 prev_dt = prev_dt.replace(tzinfo=timezone.utc)
             if prev_dt >= cutoff:
-                return True
+                return True, prev
         except ValueError:
             pass
 
@@ -681,11 +699,11 @@ def _check_history_skip_sync(history_endpoint, filter_params, price_minutes, ski
         try:
             prev_price_val = float(prev["price"])
             if prev_price_val < skip_threshold:
-                return True
+                return True, prev
         except (ValueError, TypeError):
             pass
 
-    return False
+    return False, prev
 
 
 async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishlist_minutes, price_minutes=None):
@@ -717,24 +735,18 @@ async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishli
 async def _save_inventory_price(inv_id, tracking_id, price_str, page):
     global _logger
     if not price_str or price_str == "NO_ENCONTRADO":
-        _logger.log(f"  Precio no encontrado")
         return None
 
     try:
         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
     except ValueError:
-        _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
         html = await page.content()
         fallback = extract_price_from_html(html)
         if fallback:
             price_str = fallback
             new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
-            _logger.log(f"  Precio recuperado del HTML: {price_str}")
         else:
-            _logger.log(f"  No se pudo recuperar precio del HTML")
             return None
-
-    _logger.log(f"  Precio encontrado: {price_str}")
 
     history_records = api_get_all("inventory-price-history", {
         "inventory_id": inv_id,
@@ -749,7 +761,6 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, page):
             try:
                 result = api_request("PATCH", f"inventory-price-history/{prev['id']}", {"recorded_at": now_str})
                 if result:
-                    _logger.log(f"  Precio sin cambios, actualizado timestamp (id={prev['id']})")
                     return result
             except Exception as e:
                 _logger.log(f"  Error al actualizar timestamp: {e}")
@@ -785,10 +796,8 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, page):
     }
     try:
         result = api_post("inventory-price-history", post_data)
-        _logger.log(f"  Guardado en inventory_price_history (id={result.get('id', '?')})")
         return result
     except Exception as e:
-        _logger.log(f"  Error al guardar: {e}")
         return None
 
 
