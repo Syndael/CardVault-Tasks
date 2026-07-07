@@ -461,9 +461,12 @@ def _load_smtp_config():
 
 
 def send_email_notification(to_addr, subject, message):
+    if not to_addr:
+        _logger and _logger.log("  [NOTIFY email] no recipient")
+        return
     cfg = _load_smtp_config()
-    if not cfg["host"] or not to_addr:
-        _logger and _logger.log(f"  [NOTIFY email] SMTP not configured or no recipient")
+    if not cfg["host"]:
+        _logger and _logger.log("  [NOTIFY email] SMTP not configured")
         return
     try:
         msg = MIMEText(message, "plain", "utf-8")
@@ -480,38 +483,23 @@ def send_email_notification(to_addr, subject, message):
         _logger and _logger.log(f"  [NOTIFY email] error: {e}")
 
 
-def _get_telegram_recipients():
-    ids = []
-    me = api_get("auth/me")
-    if me and me.get("telegram_id"):
-        ids.append(me["telegram_id"])
-    fallback = get_setting("bot.telegram.admin.ids")
-    if fallback:
-        for c in fallback.split(","):
-            c = c.strip()
-            if c and c not in ids:
-                ids.append(c)
-    return ids
 
 
-def send_telegram_notification(message):
+def send_telegram_notification(message, chat_id):
     bot_token = get_setting("bot.telegram.token")
-    chat_ids = _get_telegram_recipients()
-    if not bot_token or not chat_ids:
-        _logger and _logger.log("  [NOTIFY telegram] not configured")
+    if not bot_token or not chat_id:
         return
-    for cid in chat_ids:
-        try:
-            data = urllib.parse.urlencode({
-                "chat_id": cid,
-                "text": message[:4096],
-            }).encode("utf-8")
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-            urllib.request.urlopen(req, timeout=10)
-            _logger and _logger.log(f"  [NOTIFY telegram] Sent to {cid}")
-        except Exception as e:
-            _logger and _logger.log(f"  [NOTIFY telegram] error for {cid}: {e}")
+    try:
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": message[:4096],
+        }).encode("utf-8")
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        urllib.request.urlopen(req, timeout=10)
+        _logger and _logger.log(f"  [NOTIFY telegram] Sent to {chat_id}")
+    except Exception as e:
+        _logger and _logger.log(f"  [NOTIFY telegram] error for {chat_id}: {e}")
 
 
 def process_publication(pub):
@@ -599,8 +587,14 @@ def process_publication(pub):
         _logger and _logger.log(f"  [OK] Publication #{pub_id} completed: {permalink}")
 
         notify_msg = f"Publicacion #{pub_id} completada!\nProducto: {product_name}\n{permalink}"
-        send_email_notification("admin@cardvault.local", "CardVault - Publicacion Instagram", notify_msg)
-        send_telegram_notification(notify_msg)
+        owner_id = inv.get("user_id")
+        if owner_id:
+            owner = api_get(f"auth/user/{owner_id}")
+            if owner:
+                if owner.get("email"):
+                    send_email_notification(owner["email"], "CardVault - Publicacion Instagram", notify_msg)
+                if owner.get("telegram_id"):
+                    send_telegram_notification(notify_msg, owner["telegram_id"])
     else:
         api_patch(f"publications/{pub_id}", {
             "status": "failed",
