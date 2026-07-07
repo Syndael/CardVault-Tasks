@@ -28,12 +28,14 @@ import argparse
 import json
 import os
 import shutil
+import smtplib
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
 from task_logger import TaskLogger, finalize_log
@@ -443,24 +445,58 @@ def wait_for_media(creation_id, max_attempts=15):
     return False
 
 
-def send_notification(api_base, token, channel, to, message):
-    if channel == "email":
-        data = {"to": to, "subject": "CardVault - Publicacion Instagram", "message": message}
-        url = f"{api_base}/notifications/email"
-    elif channel == "telegram":
-        data = {"message": message}
-        url = f"{api_base}/notifications/telegram"
-    else:
+def _load_smtp_config():
+    host = get_setting("smtp.host")
+    port = get_setting("smtp.port")
+    user = get_setting("smtp.username")
+    pwd = get_setting("smtp.password")
+    fr = get_setting("smtp.from")
+    return {
+        "host": host or "",
+        "port": int(port) if port else 587,
+        "user": user or "",
+        "pass": pwd or "",
+        "from": fr or "cardvault@localhost",
+    }
+
+
+def send_email_notification(to_addr, subject, message):
+    cfg = _load_smtp_config()
+    if not cfg["host"] or not to_addr:
+        _logger and _logger.log(f"  [NOTIFY email] SMTP not configured or no recipient")
         return
-    body = json.dumps(data).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": f"Bearer {token}",
-    })
     try:
+        msg = MIMEText(message, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = to_addr
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=10) as server:
+            server.starttls()
+            if cfg["user"] and cfg["pass"]:
+                server.login(cfg["user"], cfg["pass"])
+            server.send_message(msg)
+        _logger and _logger.log(f"  [NOTIFY email] Sent to {to_addr}")
+    except Exception as e:
+        _logger and _logger.log(f"  [NOTIFY email] error: {e}")
+
+
+def send_telegram_notification(message):
+    bot_token = get_setting("telegram.bot.token")
+    chat_id = get_setting("telegram.chat.id")
+    if not bot_token or not chat_id:
+        _logger and _logger.log("  [NOTIFY telegram] not configured")
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": message[:4096],
+        }).encode("utf-8")
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
         urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+        _logger and _logger.log(f"  [NOTIFY telegram] Sent")
+    except Exception as e:
+        _logger and _logger.log(f"  [NOTIFY telegram] error: {e}")
 
 
 def process_publication(pub):
@@ -548,8 +584,8 @@ def process_publication(pub):
         _logger and _logger.log(f"  [OK] Publication #{pub_id} completed: {permalink}")
 
         notify_msg = f"Publicacion #{pub_id} completada!\nProducto: {product_name}\n{permalink}"
-        send_notification(API_BASE, _get_token(), "email", "admin@cardvault.local", notify_msg)
-        send_notification(API_BASE, _get_token(), "telegram", "", notify_msg)
+        send_email_notification("admin@cardvault.local", "CardVault - Publicacion Instagram", notify_msg)
+        send_telegram_notification(notify_msg)
     else:
         api_patch(f"publications/{pub_id}", {
             "status": "failed",
