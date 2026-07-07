@@ -119,11 +119,11 @@ def api_get_all(path, params=None):
 
 def _load_smtp_config():
     global _smtp_config
-    host = api_get("settings/by-key/wishlist.smtp.host")
-    port = api_get("settings/by-key/wishlist.smtp.port")
-    user = api_get("settings/by-key/wishlist.smtp.user")
-    pwd = api_get("settings/by-key/wishlist.smtp.pass")
-    fr = api_get("settings/by-key/wishlist.smtp.from")
+    host = api_get("settings/by-key/smtp.host")
+    port = api_get("settings/by-key/smtp.port")
+    user = api_get("settings/by-key/smtp.username")
+    pwd = api_get("settings/by-key/smtp.password")
+    fr = api_get("settings/by-key/smtp.from")
 
     _smtp_config = {
         "host": host.get("setting_value", "") if host else "",

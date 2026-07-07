@@ -480,23 +480,38 @@ def send_email_notification(to_addr, subject, message):
         _logger and _logger.log(f"  [NOTIFY email] error: {e}")
 
 
+def _get_telegram_recipients():
+    ids = []
+    me = api_get("auth/me")
+    if me and me.get("telegram_id"):
+        ids.append(me["telegram_id"])
+    fallback = get_setting("bot.telegram.admin.ids")
+    if fallback:
+        for c in fallback.split(","):
+            c = c.strip()
+            if c and c not in ids:
+                ids.append(c)
+    return ids
+
+
 def send_telegram_notification(message):
-    bot_token = get_setting("telegram.bot.token")
-    chat_id = get_setting("telegram.chat.id")
-    if not bot_token or not chat_id:
+    bot_token = get_setting("bot.telegram.token")
+    chat_ids = _get_telegram_recipients()
+    if not bot_token or not chat_ids:
         _logger and _logger.log("  [NOTIFY telegram] not configured")
         return
-    try:
-        data = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": message[:4096],
-        }).encode("utf-8")
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        urllib.request.urlopen(req, timeout=10)
-        _logger and _logger.log(f"  [NOTIFY telegram] Sent")
-    except Exception as e:
-        _logger and _logger.log(f"  [NOTIFY telegram] error: {e}")
+    for cid in chat_ids:
+        try:
+            data = urllib.parse.urlencode({
+                "chat_id": cid,
+                "text": message[:4096],
+            }).encode("utf-8")
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+            urllib.request.urlopen(req, timeout=10)
+            _logger and _logger.log(f"  [NOTIFY telegram] Sent to {cid}")
+        except Exception as e:
+            _logger and _logger.log(f"  [NOTIFY telegram] error for {cid}: {e}")
 
 
 def process_publication(pub):
