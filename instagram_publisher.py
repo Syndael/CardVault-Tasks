@@ -612,6 +612,26 @@ def process_publication(pub):
         })
         _logger and _logger.log(f"  [FAIL] Publication #{pub_id} failed: {error_msg}")
 
+        notify_msg = f"Publicacion #{pub_id} ERROR!\nProducto: {product_name}\nError: {error_msg}"
+        owner_id = inv.get("user_id")
+        if owner_id:
+            token = _get_token()
+            if token:
+                try:
+                    url = f"{API_BASE.rstrip('/')}/auth/user/{owner_id}"
+                    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        owner = json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    owner = None
+            else:
+                owner = None
+            if owner:
+                if owner.get("email"):
+                    send_email_notification(owner["email"], "CardVault - ERROR Publicacion Instagram", notify_msg)
+                if owner.get("telegram_id"):
+                    send_telegram_notification(notify_msg, owner["telegram_id"])
+
 
 def main():
     global _IG_TOKEN, _logger

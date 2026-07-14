@@ -463,6 +463,7 @@ async def main():
                         "collection_code": col_code,
                         "product_number": card_num,
                         "product_type_id": card_type_id,
+                        "is_manual": 1,
                         "per_page": 500
                     })
                     existing_items = (existing or {}).get("items", [])
@@ -473,6 +474,7 @@ async def main():
                 existing_items = [
                     item for item in existing_items
                     if item.get("product_number") == card_num
+                    and item.get("is_manual")
                 ]
 
                 if existing_items:
