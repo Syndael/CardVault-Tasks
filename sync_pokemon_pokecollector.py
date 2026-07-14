@@ -463,7 +463,6 @@ async def main():
                         "collection_code": col_code,
                         "product_number": card_num,
                         "product_type_id": card_type_id,
-                        "is_manual": 1,
                         "per_page": 500
                     })
                     existing_items = (existing or {}).get("items", [])
@@ -471,10 +470,15 @@ async def main():
                     existing_items = []
 
                 # Filtro exacto: product_number LIKE devuelve falsos (#1 encuentra #10)
+                # Solo saltar si ya existe un producto MANUAL con ese numero
+                def _is_manual(item):
+                    val = item.get("is_manual")
+                    return val is True or val == 1 or val == "1" or val == "true" or val == "True"
+
                 existing_items = [
                     item for item in existing_items
                     if item.get("product_number") == card_num
-                    and item.get("is_manual")
+                    and _is_manual(item)
                 ]
 
                 if existing_items:
