@@ -471,8 +471,9 @@ async def main():
 
                 # Filtro exacto: product_number LIKE devuelve falsos (#1 encuentra #10)
                 # Solo saltar si ya existe un producto MANUAL con ese numero
+                # El endpoint product-catalog devuelve "product_is_manual", no "is_manual"
                 def _is_manual(item):
-                    val = item.get("is_manual")
+                    val = item.get("product_is_manual")
                     return val is True or val == 1 or val == "1" or val == "true" or val == "True"
 
                 existing_items = [
