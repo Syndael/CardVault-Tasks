@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
     chromium chromium-sandbox \
+    ffmpeg fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

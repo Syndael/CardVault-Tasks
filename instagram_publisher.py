@@ -545,7 +545,7 @@ def share_to_story(cl, first_image_path, product_name, collection_name):
     enable_stories = get_setting("instagram.enable.stories")
     if enable_stories is not None and enable_stories.strip() in ("0", "false", "no"):
         _logger and _logger.log("  [SKIP] Stories desactivadas via config")
-        return
+        return True
 
     video_path = _create_story_video(first_image_path, product_name, collection_name)
     thumb_path = None
@@ -555,8 +555,10 @@ def share_to_story(cl, first_image_path, product_name, collection_name):
             _logger and _logger.log("  Subiendo story con video...")
             cl.video_upload_to_story(video_path, thumbnail=thumb_path)
             _logger and _logger.log("  [OK] Story con video subida")
+            return True
         except Exception as e:
-            _logger and _logger.log(f"  [WARN] Story video fallo: {e}")
+            _logger and _logger.log(f"  [FAIL] Story video fallo: {e}")
+            return False
         finally:
             for p in [video_path, thumb_path]:
                 if p:
@@ -564,8 +566,9 @@ def share_to_story(cl, first_image_path, product_name, collection_name):
                         os.unlink(p)
                     except Exception:
                         pass
-    else:
-        _logger and _logger.log("  [WARN] No se genero el video de story, se omite.")
+
+    _logger and _logger.log("  [FAIL] No se genero el video de story")
+    return False
 
 
 def build_caption(inv, product_name, collection_name):
@@ -651,6 +654,38 @@ def send_telegram_notification(message, chat_id):
         _logger and _logger.log(f"  [NOTIFY telegram] Sent to {chat_id}")
     except Exception as e:
         _logger and _logger.log(f"  [NOTIFY telegram] error for {chat_id}: {e}")
+
+
+def send_telegram_video(chat_id, video_path, caption=""):
+    global _TELEGRAM_BOT_TOKEN
+    if _TELEGRAM_BOT_TOKEN is None:
+        _TELEGRAM_BOT_TOKEN = get_setting("bot.telegram.token")
+    bot_token = _TELEGRAM_BOT_TOKEN
+    if not bot_token or not chat_id:
+        return
+    try:
+        boundary = "boundary" + str(int(time.time()))
+        with open(video_path, "rb") as fh:
+            video_data = fh.read()
+        filename = os.path.basename(video_path)
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="video"; filename="{filename}"\r\n'
+            f"Content-Type: video/mp4\r\n\r\n"
+        ).encode("utf-8") + video_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=120):
+            pass
+        _logger and _logger.log(f"  [NOTIFY telegram] Video enviado a {chat_id}")
+    except Exception as e:
+        _logger and _logger.log(f"  [NOTIFY telegram] error envio video a {chat_id}: {e}")
 
 
 def _notify_owner(inv, subject, message):
@@ -744,16 +779,39 @@ def process_publication(pub):
     media_pk = None
     permalink = None
     error_msg = None
+    story_video_path = None
+    story_thumb_path = None
+    story_failed = False
 
     try:
-        _logger and _logger.log(f"  Publishing to Instagram ({len(tmp_files)} photo(s))...")
-        ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
-
-        if ig_code:
+        stories_enabled = get_setting("instagram.enable.stories")
+        if stories_enabled is None or stories_enabled.strip() not in ("0", "false", "no"):
             first_image = tmp_files[0] if tmp_files else None
-            share_to_story(cl, first_image, product_name, collection_name)
+            story_video_path = _create_story_video(first_image, product_name, collection_name)
+            if not story_video_path:
+                error_msg = "No se pudo generar el video de story (verificar FFmpeg, musica y gif)"
+                _logger and _logger.log(f"  [FAIL] {error_msg}")
+            else:
+                story_thumb_path = _generate_thumbnail(story_video_path)
+
+        if story_video_path or stories_enabled is not None and stories_enabled.strip() in ("0", "false", "no"):
+            _logger and _logger.log(f"  Publishing to Instagram ({len(tmp_files)} photo(s))...")
+            ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
+
+            if ig_code and story_video_path:
+                try:
+                    _logger and _logger.log("  Subiendo story con video...")
+                    cl.video_upload_to_story(story_video_path, thumbnail=story_thumb_path)
+                    _logger and _logger.log("  [OK] Story con video subida")
+                except Exception as e:
+                    _logger and _logger.log(f"  [WARN] Story upload fallo, publicacion ya esta en IG: {e}")
+                    story_failed = True
+            elif ig_code:
+                _logger and _logger.log("  [SKIP] Stories desactivadas via config")
+            else:
+                error_msg = error
         else:
-            error_msg = error
+            error_msg = error_msg or "Story generation failed"
     except LoginRequired:
         _logger and _logger.log("  Sesion IG expirada, limpiando y reintentando...")
         global _IG_CLIENT
@@ -766,6 +824,12 @@ def process_publication(pub):
         _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
     finally:
         cleanup_temp_files(tmp_files)
+        for p in [story_thumb_path]:
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
     if ig_code:
         update_data = {
@@ -780,6 +844,23 @@ def process_publication(pub):
             api_post("inventory-urls", {"inventory_id": inv_id, "url": permalink})
         _logger and _logger.log(f"  [OK] Publication #{pub_id} completed: {permalink}")
 
+        if story_failed:
+            owner_id = inv.get("user_id")
+            if owner_id and story_video_path:
+                token = _get_token()
+                if token:
+                    try:
+                        url = f"{API_BASE.rstrip('/')}/auth/user/{owner_id}"
+                        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            owner = json.loads(resp.read().decode("utf-8"))
+                        if owner and owner.get("telegram_id"):
+                            send_telegram_video(owner["telegram_id"], story_video_path,
+                                                f"Story fallida para #{pub_id}: {product_name}")
+                    except Exception:
+                        pass
+            _logger and _logger.log("  [WARN] Story no se subio. Publicacion en IG correcta pero sin story.")
+
         notify_msg = f"Publicacion #{pub_id} completada!\nProducto: {product_name}\n{permalink}"
         _notify_owner(inv, "CardVault - Publicacion Instagram", notify_msg)
     else:
@@ -791,6 +872,12 @@ def process_publication(pub):
 
         notify_msg = f"Publicacion #{pub_id} ERROR!\nProducto: {product_name}\nError: {error_msg}"
         _notify_owner(inv, "CardVault - ERROR Publicacion Instagram", notify_msg)
+
+    if story_video_path:
+        try:
+            os.unlink(story_video_path)
+        except Exception:
+            pass
 
 
 def main():
