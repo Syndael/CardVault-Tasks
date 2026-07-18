@@ -803,7 +803,7 @@ def main():
         print("[FAIL] Could not authenticate with CardVault API")
         sys.exit(1)
 
-    settings_data = api_get("settings") or {}
+    settings_data = api_get("settings?per_page=500") or {}
     settings_list = settings_data.get("items", [])
     settings_by_key = {item["setting_key"]: item.get("setting_value") for item in settings_list if "setting_key" in item}
 
