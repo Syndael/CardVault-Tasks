@@ -51,6 +51,7 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, BadPassword, ChallengeRequired
+from instagrapi.types import StoryLink
 from PIL import Image, ImageDraw, ImageFilter
 
 from task_logger import TaskLogger, finalize_log
@@ -388,32 +389,24 @@ def _pick_overlay(collection_name):
     return None
 
 
-def _render_story_frame(image_path, overlay_path=None):
+def _render_story_frame(image_path):
     W, H = 1080, 1920
-    FG_W, FG_H = 810, 1440
-    RADIUS = 50
+    HALF = (540, 960)
+    FG_W, FG_H = 405, 720
+    RADIUS = 25
 
     img = Image.open(image_path).convert("RGBA")
-    overlay = None
-    if overlay_path:
-        try:
-            ovl = Image.open(overlay_path)
-            if getattr(ovl, "is_animated", False):
-                ovl.seek(0)
-            overlay = ovl.convert("RGBA")
-        except Exception:
-            pass
 
     img.thumbnail((FG_W, FG_H), Image.LANCZOS)
     fg_w, fg_h = img.size
-    fg_x = (W - fg_w) // 2
-    fg_y = (H - fg_h) // 2
+    fg_x = (HALF[0] - fg_w) // 2
+    fg_y = (HALF[1] - fg_h) // 2
 
     blur_bg = img.copy()
-    blur_bg = blur_bg.resize((W, H), Image.LANCZOS)
-    blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(radius=30))
+    blur_bg = blur_bg.resize(HALF, Image.LANCZOS)
+    blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(radius=15))
 
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    canvas = Image.new("RGBA", HALF, (0, 0, 0, 255))
     canvas.paste(blur_bg, (0, 0))
 
     mask = Image.new("L", (fg_w, fg_h), 0)
@@ -422,33 +415,34 @@ def _render_story_frame(image_path, overlay_path=None):
 
     canvas.paste(img, (fg_x, fg_y), mask)
 
-    if overlay:
-        ovl_w = random.randint(300, 480)
-        ovl.thumbnail((ovl_w, ovl_w), Image.LANCZOS)
-        ow, oh = ovl.size
-        corner = random.choice(["tl", "tr", "bl", "br"])
-        m = 60
-        jx = 200
-        jy = 350
-        if corner == "tl":
-            ox = random.randint(m, m + jx)
-            oy = random.randint(m, m + jy)
-        elif corner == "tr":
-            ox = random.randint(W - ow - jx - m, W - ow - m)
-            oy = random.randint(m, m + jy)
-        elif corner == "bl":
-            ox = random.randint(m, m + jx)
-            oy = random.randint(H - oh - jy - m, H - oh - m)
-        else:
-            ox = random.randint(W - ow - jx - m, W - ow - m)
-            oy = random.randint(H - oh - jy - m, H - oh - m)
-        canvas.paste(overlay, (ox, oy), overlay)
-
-    fd, frame_path = tempfile.mkstemp(suffix=".png")
+    fd, frame_path = tempfile.mkstemp(suffix=".jpg")
     os.close(fd)
     canvas = canvas.convert("RGB")
-    canvas.save(frame_path, "PNG")
+    canvas.save(frame_path, "JPEG", quality=90)
     return frame_path
+
+
+def _compute_overlay_pos(overlay_path):
+    W, H = 540, 960
+    MARGIN = 20
+    try:
+        ovl = Image.open(overlay_path)
+        w, h = ovl.size
+    except Exception:
+        return None, None, None, None
+
+    target_ratio = random.uniform(0.15, 0.20)
+    ov_area = W * H * target_ratio
+    aspect = w / h if h > 0 else 1.0
+    ow = int((ov_area * aspect) ** 0.5)
+    oh = max(int(ow / aspect), 1)
+
+    max_x = max(W - ow - MARGIN, MARGIN)
+    max_y = max(H - oh - MARGIN, MARGIN)
+    ox = random.randint(MARGIN, max(max_x, MARGIN))
+    oy = random.randint(MARGIN, max(max_y, MARGIN))
+
+    return ox, oy, ow, oh
 
 
 def _create_story_video(image_path, collection_name, output_path=None):
@@ -463,7 +457,7 @@ def _create_story_video(image_path, collection_name, output_path=None):
 
     try:
         _logger and _logger.log("  Renderizando frame con Pillow...")
-        frame_path = _render_story_frame(image_path, overlay_path)
+        frame_path = _render_story_frame(image_path)
         _logger and _logger.log(f"  Frame renderizado: {frame_path}")
 
         if output_path:
@@ -473,24 +467,53 @@ def _create_story_video(image_path, collection_name, output_path=None):
             os.close(fd)
 
         duration = 15
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", frame_path,
-        ]
+        cmd = ["ffmpeg", "-y"]
+
+        if overlay_path:
+            ox, oy, ow, oh = _compute_overlay_pos(overlay_path)
+            if ox is None:
+                overlay_path = None
+                _logger and _logger.log("  Overlay no valido, omitiendo")
+            else:
+                _logger and _logger.log(f"  Overlay GIF pos=({ox},{oy}) size=({ow},{oh})")
+
+        if overlay_path:
+            overlay_ext = os.path.splitext(overlay_path)[1].lower()
+            if overlay_ext == ".gif":
+                cmd += ["-loop", "1", "-i", frame_path, "-stream_loop", "-1", "-i", overlay_path]
+            else:
+                cmd += ["-loop", "1", "-i", frame_path, "-loop", "1", "-i", overlay_path]
+        else:
+            cmd += ["-loop", "1", "-i", frame_path]
+
         if music_path:
             cmd += ["-i", music_path]
+
+        if overlay_path:
+            vf = (
+                f"[1:v]scale={ow}:{oh},setsar=1[ov];"
+                f"[0:v][ov]overlay={ox}:{oy},scale=1080:1920:flags=lanczos[outv]"
+            )
+            cmd += ["-filter_complex", vf, "-map", "[outv]"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                    "-vf", "scale=1080:1920:flags=lanczos"]
+
         cmd += [
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
             "-pix_fmt", "yuv420p", "-t", str(duration),
             "-movflags", "+faststart",
         ]
+
         if music_path:
-            cmd += ["-map", "0:v", "-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
+            if overlay_path:
+                cmd += ["-map", "2:a:0", "-shortest", "-c:a", "aac", "-b:a", "128k"]
+            else:
+                cmd += ["-map", "1:a:0", "-shortest", "-c:a", "aac", "-b:a", "128k"]
         else:
             cmd += ["-an"]
         cmd += [video_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode != 0:
             _logger and _logger.log(f"  FFmpeg error: {result.stderr[-500:]}")
             if not output_path:
@@ -688,8 +711,6 @@ def process_publication(pub):
     _logger and _logger.log(f"  Collection: {collection_name}")
     _logger and _logger.log(f"  Files: {len(file_ids)} image(s)")
 
-    api_patch(f"publications/{pub_id}", {"status": "processing"})
-
     if len(file_ids) > _MAX_CAROUSEL_ITEMS:
         _logger and _logger.log(f"  [WARN] {len(file_ids)} images found, only first {_MAX_CAROUSEL_ITEMS} will be published")
         file_ids = file_ids[:_MAX_CAROUSEL_ITEMS]
@@ -702,6 +723,9 @@ def process_publication(pub):
 
     dev_mode = (_DEV_MODE or
                 (get_setting("instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
+
+    if not dev_mode:
+        api_patch(f"publications/{pub_id}", {"status": "processing"})
 
     cl = None
     if not dev_mode:
@@ -741,7 +765,7 @@ def process_publication(pub):
         if dev_mode:
             dev_base = (get_setting("instagram.dev.output") or
                         os.path.join(_SCRIPT_DIR, "dev_output"))
-            dev_dir = os.path.join(dev_base, str(pub_id))
+            dev_dir = os.path.join(os.path.abspath(dev_base), str(pub_id))
             os.makedirs(dev_dir, exist_ok=True)
             _logger and _logger.log(f"  [DEV] Modo developer activo, guardando en {dev_dir}...")
             os.makedirs(dev_dir, exist_ok=True)
@@ -766,7 +790,8 @@ def process_publication(pub):
             if ig_code and story_video_path:
                 try:
                     _logger and _logger.log("  Subiendo story con video...")
-                    cl.video_upload_to_story(story_video_path, thumbnail=story_frame_path)
+                    links = [StoryLink(webUri=permalink)] if permalink else []
+                    cl.video_upload_to_story(story_video_path, thumbnail=story_frame_path, links=links)
                     _logger and _logger.log("  [OK] Story con video subida")
                 except Exception as e:
                     _logger and _logger.log(f"  [WARN] Story upload fallo, publicacion ya esta en IG: {e}")
@@ -904,6 +929,7 @@ def main():
         dev_output = (settings_by_key.get("instagram.dev.output") or
                       get_setting("instagram.dev.output") or
                       os.path.join(_SCRIPT_DIR, "dev_output"))
+        dev_output = os.path.abspath(dev_output)
         _logger.log("[DEV] Modo developer activo — no se publica en Instagram")
         _logger.log(f"[DEV] Salida: {dev_output}")
 
@@ -934,10 +960,11 @@ def main():
             return
 
         for pub in pending:
-            cl = get_ig_client()
-            if not cl:
-                _logger.log("[FAIL] IG session lost mid-run, aborting remaining")
-                break
+            if not dev_mode:
+                cl = get_ig_client()
+                if not cl:
+                    _logger.log("[FAIL] IG session lost mid-run, aborting remaining")
+                    break
             process_publication(pub)
 
     _logger.log("[DONE] Instagram publisher finished")
