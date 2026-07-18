@@ -200,8 +200,8 @@ def get_ig_client() -> Client | None:
     if _IG_CLIENT is not None:
         return _IG_CLIENT
 
-    ig_username = get_setting("instagram.username") or os.getenv("IG_USERNAME")
-    ig_password = get_setting("instagram.password") or os.getenv("IG_PASSWORD")
+    ig_username = get_setting("instagram.username")
+    ig_password = get_setting("instagram.password")
 
     if not ig_username or not ig_password:
         _logger and _logger.log("[FAIL] No Instagram credentials. Set 'instagram.username' and 'instagram.password'")
@@ -284,7 +284,7 @@ def publish_instagram(cl, image_paths, caption):
 
 
 def _pick_music(collection_name):
-    music_dir = get_setting("instagram.music.dir") or os.getenv("IG_MUSIC_DIR")
+    music_dir = get_setting("instagram.music.dir")
     if not music_dir:
         return None
     if music_dir.startswith("./"):
@@ -329,7 +329,7 @@ def _tcg_folder(collection_name):
 
 
 def _pick_overlay(collection_name):
-    gif_dir = get_setting("instagram.gif.dir") or os.getenv("IG_GIF_DIR") or _GIF_DIR
+    gif_dir = get_setting("instagram.gif.dir") or _GIF_DIR
     if gif_dir.startswith("./"):
         gif_dir = os.path.join(_SCRIPT_DIR, gif_dir[2:])
     if not os.path.isdir(gif_dir):
@@ -815,23 +815,25 @@ def main():
 
     _logger.log(f"CardVault API: {API_BASE}")
     _logger.log("[OK] Authenticated")
+    _logger.log(f"Settings loaded: {len(settings_list)} total, {len(settings_by_key)} by key")
 
-    custom_session = settings_by_key.get("instagram.session.path") or os.getenv("IG_SESSION_PATH")
+    custom_session = settings_by_key.get("instagram.session.path")
     if custom_session:
         _SESSION_FILE = custom_session
     _logger.log(f"IG Session file: {_SESSION_FILE}")
 
-    ig_username = settings_by_key.get("instagram.username") or os.getenv("IG_USERNAME")
-    ig_password = settings_by_key.get("instagram.password") or os.getenv("IG_PASSWORD")
+    ig_username = (settings_by_key.get("instagram.username") or
+                   get_setting("instagram.username"))
+    ig_password = (settings_by_key.get("instagram.password") or
+                   get_setting("instagram.password"))
 
     if not ig_username or not ig_password:
         _logger.log("[FAIL] No Instagram credentials.")
         _logger.log("  Set settings 'instagram.username' and 'instagram.password' in CardVault")
-        _logger.log("  or env vars IG_USERNAME, IG_PASSWORD")
         finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
         sys.exit(1)
 
-    music_dir = settings_by_key.get("instagram.music.dir") or os.getenv("IG_MUSIC_DIR")
+    music_dir = settings_by_key.get("instagram.music.dir")
     if music_dir:
         _logger.log(f"[OK] IG Music dir: {music_dir}")
     else:
