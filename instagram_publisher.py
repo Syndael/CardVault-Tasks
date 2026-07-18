@@ -51,6 +51,7 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, BadPassword, ChallengeRequired
+from PIL import Image, ImageDraw, ImageFilter
 
 from task_logger import TaskLogger, finalize_log
 
@@ -93,8 +94,7 @@ _TCG_FOLDER_MAP = {
     "World of Warcraft TCG": "wow", "WoW TCG": "wow",
 }
 
-_FONT_FILE: str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-_GIF_DIR: str = os.path.join(_SCRIPT_DIR, "gif")
+_DEV_MODE: bool = os.getenv("IG_DEV_MODE", "").lower() in ("1", "true", "yes")
 
 _IG_CLIENT: Client | None = None
 _SESSION_FILE: str = os.path.join(_SCRIPT_DIR, "ig_session.json")
@@ -342,7 +342,7 @@ def _tcg_folder(collection_name):
 
 
 def _pick_overlay(collection_name):
-    gif_dir = get_setting("instagram.gif.dir") or _GIF_DIR
+    gif_dir = get_setting("instagram.gif.dir") or os.path.join(_SCRIPT_DIR, "gif")
     if gif_dir.startswith("./"):
         gif_dir = os.path.join(_SCRIPT_DIR, gif_dir[2:])
     if not os.path.isdir(gif_dir):
@@ -388,43 +388,84 @@ def _pick_overlay(collection_name):
     return None
 
 
-def _generate_thumbnail(video_path):
-    if not shutil.which("ffmpeg"):
-        return None
-    try:
-        fd, thumb_path = tempfile.mkstemp(suffix=".jpg")
-        os.close(fd)
-        result = subprocess.run([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "2",
-            thumb_path,
-        ], capture_output=True, text=True, timeout=15)
-        if result.returncode == 0 and os.path.getsize(thumb_path) > 0:
-            return thumb_path
+def _render_story_frame(image_path, overlay_path=None):
+    W, H = 1080, 1920
+    FG_W, FG_H = 810, 1440
+    RADIUS = 50
+
+    img = Image.open(image_path).convert("RGBA")
+    overlay = None
+    if overlay_path:
         try:
-            os.unlink(thumb_path)
+            ovl = Image.open(overlay_path)
+            if getattr(ovl, "is_animated", False):
+                ovl.seek(0)
+            overlay = ovl.convert("RGBA")
         except Exception:
             pass
-        return None
-    except Exception as e:
-        _logger and _logger.log(f"  Thumbnail fallo: {e}")
-        return None
+
+    img.thumbnail((FG_W, FG_H), Image.LANCZOS)
+    fg_w, fg_h = img.size
+    fg_x = (W - fg_w) // 2
+    fg_y = (H - fg_h) // 2
+
+    blur_bg = img.copy()
+    blur_bg = blur_bg.resize((W, H), Image.LANCZOS)
+    blur_bg = blur_bg.filter(ImageFilter.GaussianBlur(radius=30))
+
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    canvas.paste(blur_bg, (0, 0))
+
+    mask = Image.new("L", (fg_w, fg_h), 0)
+    d = ImageDraw.Draw(mask)
+    d.rounded_rectangle([(0, 0), (fg_w, fg_h)], radius=RADIUS, fill=255)
+
+    canvas.paste(img, (fg_x, fg_y), mask)
+
+    if overlay:
+        ovl_w = random.randint(300, 480)
+        ovl.thumbnail((ovl_w, ovl_w), Image.LANCZOS)
+        ow, oh = ovl.size
+        corner = random.choice(["tl", "tr", "bl", "br"])
+        m = 60
+        jx = 200
+        jy = 350
+        if corner == "tl":
+            ox = random.randint(m, m + jx)
+            oy = random.randint(m, m + jy)
+        elif corner == "tr":
+            ox = random.randint(W - ow - jx - m, W - ow - m)
+            oy = random.randint(m, m + jy)
+        elif corner == "bl":
+            ox = random.randint(m, m + jx)
+            oy = random.randint(H - oh - jy - m, H - oh - m)
+        else:
+            ox = random.randint(W - ow - jx - m, W - ow - m)
+            oy = random.randint(H - oh - jy - m, H - oh - m)
+        canvas.paste(overlay, (ox, oy), overlay)
+
+    fd, frame_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    canvas = canvas.convert("RGB")
+    canvas.save(frame_path, "PNG")
+    return frame_path
 
 
-def _create_story_video(image_path, product_name, collection_name, output_path=None):
+def _create_story_video(image_path, collection_name, output_path=None):
     if not shutil.which("ffmpeg"):
         _logger and _logger.log("  FFmpeg no encontrado")
-        return None
+        return None, None
 
     music_path = _pick_music(collection_name)
     overlay_path = _pick_overlay(collection_name)
     if not music_path:
         _logger and _logger.log("  Generando story sin musica (video silencioso)")
-    safe_name = product_name[:40].replace("'", "'\\''")
 
     try:
+        _logger and _logger.log("  Renderizando frame con Pillow...")
+        frame_path = _render_story_frame(image_path, overlay_path)
+        _logger and _logger.log(f"  Frame renderizado: {frame_path}")
+
         if output_path:
             video_path = output_path
         else:
@@ -432,89 +473,24 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
             os.close(fd)
 
         duration = 15
-        font = os.path.exists(_FONT_FILE)
-        font_draw = f"fontfile='{_FONT_FILE}':" if font else ""
-
-        text_filter = (
-            f"drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black@0.45:t=fill,"
-            f"drawtext={font_draw}text='NUEVO POST':fontcolor=white:fontsize=72:"
-            f"x=(w-text_w)/2:y=h*0.79:box=1:boxcolor=black@0.5:boxborderw=16:"
-            f"shadowcolor=black:shadowx=3:shadowy=3,"
-            f"drawtext={font_draw}text='{safe_name}':fontcolor=white:fontsize=38:"
-            f"x=(w-text_w)/2:y=h*0.87:box=1:boxcolor=black@0.5:boxborderw=10:"
-            f"shadowcolor=black:shadowx=2:shadowy=2"
-        )
-
-        base_filter = (
-            f"[0:v]split[bg][fg];"
-            f"[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,boxblur=20:10[bg];"
-            f"[fg]scale=810:1440:force_original_aspect_ratio=decrease,"
-            f"format=rgba,"
-            f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-            f"a='if("
-            f"lt(X,50)*lt(Y,50)*gt(hypot(50-X,50-Y),50)+"
-            f"gt(X,W-50)*lt(Y,50)*gt(hypot(X-(W-50),50-Y),50)+"
-            f"lt(X,50)*gt(Y,H-50)*gt(hypot(50-X,Y-(H-50)),50)+"
-            f"gt(X,W-50)*gt(Y,H-50)*gt(hypot(X-(W-50),Y-(H-50)),50)"
-            f",0,255)'[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base]"
-        )
-
-        if overlay_path:
-            ovl_w = random.randint(300, 480)
-            corner = random.choice(["tl", "tr", "bl", "br"])
-            m = 20
-            jx = 200
-            jy = 350
-            if corner == "tl":
-                ovl_x = random.randint(m, m + jx)
-                ovl_y = random.randint(m, m + jy)
-            elif corner == "tr":
-                ovl_x = random.randint(1080 - ovl_w - jx, 1080 - ovl_w - m)
-                ovl_y = random.randint(m, m + jy)
-            elif corner == "bl":
-                ovl_x = random.randint(m, m + jx)
-                ovl_y = random.randint(1920 - ovl_w - jy, 1920 - ovl_w - m)
-            else:
-                ovl_x = random.randint(1080 - ovl_w - jx, 1080 - ovl_w - m)
-                ovl_y = random.randint(1920 - ovl_w - jy, 1920 - ovl_w - m)
-            ovl_input = 2 if music_path else 1
-            filter_chain = (
-                f"{base_filter};"
-                f"[{ovl_input}:v]scale={ovl_w}:-1[ovl];"
-                f"[base][ovl]overlay={ovl_x}:{ovl_y}[with_ovl];"
-                f"[with_ovl]{text_filter}[v]"
-            )
-        else:
-            filter_chain = f"{base_filter};[base]{text_filter}[v]"
-
         cmd = [
             "ffmpeg", "-y",
-            "-threads", "2",
-            "-loop", "1", "-i", image_path,
+            "-loop", "1", "-i", frame_path,
         ]
         if music_path:
             cmd += ["-i", music_path]
-        if overlay_path:
-            if overlay_path.lower().endswith(".gif"):
-                cmd += ["-ignore_loop", "0", "-i", overlay_path]
-            else:
-                cmd += ["-loop", "1", "-i", overlay_path]
         cmd += [
-            "-filter_complex", filter_chain,
-            "-map", "[v]",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
             "-pix_fmt", "yuv420p", "-t", str(duration),
             "-movflags", "+faststart",
         ]
         if music_path:
-            cmd += ["-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
+            cmd += ["-map", "0:v", "-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
         else:
             cmd += ["-an"]
         cmd += [video_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             _logger and _logger.log(f"  FFmpeg error: {result.stderr[-500:]}")
             if not output_path:
@@ -522,47 +498,18 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
                     os.unlink(video_path)
                 except Exception:
                     pass
-            return None
+            return None, frame_path
 
         if os.path.getsize(video_path) > 0:
-            return video_path
-        return None
+            _logger and _logger.log(f"  Video generado: {video_path}")
+            return video_path, frame_path
+        return None, frame_path
     except subprocess.TimeoutExpired:
-        _logger and _logger.log("  FFmpeg timeout, el NAS no pudo en 10 min")
-        return None
+        _logger and _logger.log("  FFmpeg timeout")
+        return None, None
     except Exception as e:
         _logger and _logger.log(f"  FFmpeg excepcion: {e}")
-        return None
-
-
-def share_to_story(cl, first_image_path, product_name, collection_name):
-    enable_stories = get_setting("instagram.enable.stories")
-    if enable_stories is not None and enable_stories.strip() in ("0", "false", "no"):
-        _logger and _logger.log("  [SKIP] Stories desactivadas via config")
-        return True
-
-    video_path = _create_story_video(first_image_path, product_name, collection_name)
-    thumb_path = None
-    if video_path:
-        try:
-            thumb_path = _generate_thumbnail(video_path)
-            _logger and _logger.log("  Subiendo story con video...")
-            cl.video_upload_to_story(video_path, thumbnail=thumb_path)
-            _logger and _logger.log("  [OK] Story con video subida")
-            return True
-        except Exception as e:
-            _logger and _logger.log(f"  [FAIL] Story video fallo: {e}")
-            return False
-        finally:
-            for p in [video_path, thumb_path]:
-                if p:
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
-
-    _logger and _logger.log("  [FAIL] No se genero el video de story")
-    return False
+        return None, None
 
 
 def build_caption(inv, product_name, collection_name):
@@ -753,12 +700,17 @@ def process_publication(pub):
         api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
         return
 
-    cl = get_ig_client()
-    if not cl:
-        error_msg = "Could not connect to Instagram"
-        _logger and _logger.log(f"  [FAIL] {error_msg}")
-        api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
-        return
+    dev_mode = (_DEV_MODE or
+                (get_setting("instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
+
+    cl = None
+    if not dev_mode:
+        cl = get_ig_client()
+        if not cl:
+            error_msg = "Could not connect to Instagram"
+            _logger and _logger.log(f"  [FAIL] {error_msg}")
+            api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
+            return
 
     _logger and _logger.log(f"  Downloading {len(file_ids)} image(s)...")
     tmp_files = download_images_to_temp(file_ids)
@@ -774,28 +726,44 @@ def process_publication(pub):
     permalink = None
     error_msg = None
     story_video_path = None
-    story_thumb_path = None
+    story_frame_path = None
     story_failed = False
 
     try:
         stories_enabled = get_setting("instagram.enable.stories")
         if stories_enabled is None or stories_enabled.strip() not in ("0", "false", "no"):
             first_image = tmp_files[0] if tmp_files else None
-            story_video_path = _create_story_video(first_image, product_name, collection_name)
+            story_video_path, story_frame_path = _create_story_video(first_image, collection_name)
             if not story_video_path:
                 error_msg = "No se pudo generar el video de story (verificar FFmpeg, musica y gif)"
                 _logger and _logger.log(f"  [FAIL] {error_msg}")
-            else:
-                story_thumb_path = _generate_thumbnail(story_video_path)
 
-        if story_video_path or stories_enabled is not None and stories_enabled.strip() in ("0", "false", "no"):
+        if dev_mode:
+            _logger and _logger.log("  [DEV] Modo developer activo, guardando en dev_output/...")
+            dev_dir = os.path.join(_SCRIPT_DIR, "dev_output", str(pub_id))
+            os.makedirs(dev_dir, exist_ok=True)
+            for i, f in enumerate(tmp_files):
+                ext = os.path.splitext(f)[1] or ".jpg"
+                dest = os.path.join(dev_dir, f"foto_{i + 1}{ext}")
+                shutil.copy2(f, dest)
+            caption_file = os.path.join(dev_dir, "caption.txt")
+            with open(caption_file, "w", encoding="utf-8") as cf:
+                cf.write(caption)
+            if story_frame_path:
+                shutil.copy2(story_frame_path, os.path.join(dev_dir, "story_frame.png"))
+            if story_video_path:
+                shutil.copy2(story_video_path, os.path.join(dev_dir, "story.mp4"))
+            _logger and _logger.log(f"  [DEV] Archivos guardados en: {dev_dir}")
+            ig_code = f"DEV_{pub_id}"
+            permalink = dev_dir
+        elif story_video_path or stories_enabled is not None and stories_enabled.strip() in ("0", "false", "no"):
             _logger and _logger.log(f"  Publishing to Instagram ({len(tmp_files)} photo(s))...")
             ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
 
             if ig_code and story_video_path:
                 try:
                     _logger and _logger.log("  Subiendo story con video...")
-                    cl.video_upload_to_story(story_video_path, thumbnail=story_thumb_path)
+                    cl.video_upload_to_story(story_video_path, thumbnail=story_frame_path)
                     _logger and _logger.log("  [OK] Story con video subida")
                 except Exception as e:
                     _logger and _logger.log(f"  [WARN] Story upload fallo, publicacion ya esta en IG: {e}")
@@ -818,14 +786,8 @@ def process_publication(pub):
         _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
     finally:
         cleanup_temp_files(tmp_files)
-        for p in [story_thumb_path]:
-            if p:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
 
-    if ig_code:
+    if ig_code and not dev_mode:
         update_data = {
             "status": "published",
             "published_at": datetime.now().isoformat(),
@@ -857,21 +819,25 @@ def process_publication(pub):
 
         notify_msg = f"Publicacion #{pub_id} completada!\nProducto: {product_name}\n{permalink}"
         _notify_owner(inv, "CardVault - Publicacion Instagram", notify_msg)
+    elif ig_code and dev_mode:
+        _logger and _logger.log(f"  [DEV] Publicacion #{pub_id} guardada en modo developer")
     else:
-        api_patch(f"publications/{pub_id}", {
-            "status": "failed",
-            "error_message": error_msg or "Unknown error",
-        })
+        if not dev_mode:
+            api_patch(f"publications/{pub_id}", {
+                "status": "failed",
+                "error_message": error_msg or "Unknown error",
+            })
         _logger and _logger.log(f"  [FAIL] Publication #{pub_id} failed: {error_msg}")
 
         notify_msg = f"Publicacion #{pub_id} ERROR!\nProducto: {product_name}\nError: {error_msg}"
         _notify_owner(inv, "CardVault - ERROR Publicacion Instagram", notify_msg)
 
-    if story_video_path:
-        try:
-            os.unlink(story_video_path)
-        except Exception:
-            pass
+    for p in [story_video_path, story_frame_path]:
+        if p and not dev_mode:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 def main():
@@ -914,25 +880,32 @@ def main():
     ig_password = (settings_by_key.get("instagram.password") or
                    get_setting("instagram.password"))
 
-    if not ig_username or not ig_password:
-        _logger.log("[FAIL] No Instagram credentials.")
-        _logger.log("  Set settings 'instagram.username' and 'instagram.password' in CardVault")
-        finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
-        sys.exit(1)
+    dev_mode = (_DEV_MODE or
+                (settings_by_key.get("instagram.dev.mode") or get_setting("instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
+
+    if not dev_mode:
+        if not ig_username or not ig_password:
+            _logger.log("[FAIL] No Instagram credentials.")
+            _logger.log("  Set settings 'instagram.username' and 'instagram.password' in CardVault")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            sys.exit(1)
+
+        _logger.log(f"IG User: {ig_username}")
+
+        cl = get_ig_client()
+        if not cl:
+            _logger.log("[FAIL] Could not login to Instagram")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            sys.exit(1)
+    else:
+        _logger.log("[DEV] Modo developer activo — no se publica en Instagram")
+        _logger.log(f"[DEV] Salida: {os.path.join(_SCRIPT_DIR, 'dev_output')}")
 
     music_dir = settings_by_key.get("instagram.music.dir")
     if music_dir:
         _logger.log(f"[OK] IG Music dir: {music_dir}")
     else:
-        _logger.log("[INFO] No 'instagram.music.dir' configured. Story videos will be images only.")
-
-    _logger.log(f"IG User: {ig_username}")
-
-    cl = get_ig_client()
-    if not cl:
-        _logger.log("[FAIL] Could not login to Instagram")
-        finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
-        sys.exit(1)
+        _logger.log("[INFO] No 'instagram.music.dir' configured.")
 
     if args.publication_id:
         pub = api_get(f"publications/{args.publication_id}")
