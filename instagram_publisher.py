@@ -316,12 +316,19 @@ def _pick_music(collection_name):
 
     random.shuffle(songs)
     for chosen in songs:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", chosen],
-            capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            _logger and _logger.log(f"  Audio descartado (invalido): {os.path.basename(chosen)}")
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", chosen],
+                capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                _logger and _logger.log(f"  Audio descartado (invalido): {os.path.basename(chosen)}")
+                continue
+        except subprocess.TimeoutExpired:
+            _logger and _logger.log(f"  Audio descartado (timeout): {os.path.basename(chosen)}")
+            continue
+        except Exception as e:
+            _logger and _logger.log(f"  Audio descartado (error): {os.path.basename(chosen)}: {e}")
             continue
         _logger and _logger.log(f"  Musica seleccionada: {os.path.basename(chosen)} [{folder}]")
         return chosen
@@ -413,6 +420,8 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
 
     music_path = _pick_music(collection_name)
     overlay_path = _pick_overlay(collection_name)
+    if not music_path:
+        _logger and _logger.log("  Generando story sin musica (video silencioso)")
     safe_name = product_name[:40].replace("'", "'\\''")
 
     try:
@@ -523,7 +532,7 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
                 "-pix_fmt", "yuv420p", "-t", str(duration),
                 "-movflags", "+faststart", video_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if result.returncode != 0:
             _logger and _logger.log(f"  FFmpeg error: {result.stderr[-800:]}")
             if not output_path:
