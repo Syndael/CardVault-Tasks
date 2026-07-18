@@ -207,12 +207,16 @@ def get_ig_client() -> Client | None:
         _logger and _logger.log("[FAIL] No Instagram credentials. Set 'instagram.username' and 'instagram.password'")
         return None
 
+    session_file = _SESSION_FILE
+    if os.path.isdir(session_file):
+        session_file = os.path.join(session_file, "ig_session.json")
+
     cl = Client()
     cl.delay_range = [2, 5]
 
-    if os.path.exists(_SESSION_FILE):
+    if os.path.isfile(session_file):
         try:
-            cl.load_settings(_SESSION_FILE)
+            cl.load_settings(session_file)
             cl.login(ig_username, ig_password)
             cl.get_timeline_feed()
             _logger and _logger.log("[OK] IG session restaurada desde archivo")
@@ -220,12 +224,14 @@ def get_ig_client() -> Client | None:
             return cl
         except (LoginRequired, Exception) as e:
             _logger and _logger.log(f"[WARN] No se pudo restaurar sesion IG: {e}, haciendo login fresco...")
-            if os.path.exists(_SESSION_FILE):
-                os.remove(_SESSION_FILE)
+            try:
+                os.unlink(session_file)
+            except Exception:
+                pass
 
     try:
         cl.login(ig_username, ig_password)
-        cl.dump_settings(_SESSION_FILE)
+        cl.dump_settings(session_file)
         _logger and _logger.log("[OK] Login en IG correcto, sesion guardada")
         _IG_CLIENT = cl
         return cl
@@ -752,8 +758,8 @@ def process_publication(pub):
         _logger and _logger.log("  Sesion IG expirada, limpiando y reintentando...")
         global _IG_CLIENT
         _IG_CLIENT = None
-        if os.path.exists(_SESSION_FILE):
-            os.remove(_SESSION_FILE)
+        if os.path.isfile(_SESSION_FILE):
+            os.unlink(_SESSION_FILE)
         error_msg = "Instagram session expired, will retry on next run"
     except Exception as e:
         error_msg = str(e)
