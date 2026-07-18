@@ -799,6 +799,10 @@ def main():
         print("[FAIL] CARDVAULT_API_BASE not set in .env")
         sys.exit(1)
 
+    if not _login():
+        print("[FAIL] Could not authenticate with CardVault API")
+        sys.exit(1)
+
     settings_data = api_get("settings") or {}
     settings_list = settings_data.get("items", [])
     settings_by_key = {item["setting_key"]: item.get("setting_value") for item in settings_list if "setting_key" in item}
@@ -810,9 +814,6 @@ def main():
     _logger = TaskLogger(log_dir, "instagram_publisher")
 
     _logger.log(f"CardVault API: {API_BASE}")
-    if not _login():
-        _logger.log("[FAIL] Could not authenticate")
-        sys.exit(1)
     _logger.log("[OK] Authenticated")
 
     custom_session = settings_by_key.get("instagram.session.path") or os.getenv("IG_SESSION_PATH")
