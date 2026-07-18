@@ -739,8 +739,11 @@ def process_publication(pub):
                 _logger and _logger.log(f"  [FAIL] {error_msg}")
 
         if dev_mode:
-            _logger and _logger.log("  [DEV] Modo developer activo, guardando en dev_output/...")
-            dev_dir = os.path.join(_SCRIPT_DIR, "dev_output", str(pub_id))
+            dev_base = (get_setting("instagram.dev.output") or
+                        os.path.join(_SCRIPT_DIR, "dev_output"))
+            dev_dir = os.path.join(dev_base, str(pub_id))
+            os.makedirs(dev_dir, exist_ok=True)
+            _logger and _logger.log(f"  [DEV] Modo developer activo, guardando en {dev_dir}...")
             os.makedirs(dev_dir, exist_ok=True)
             for i, f in enumerate(tmp_files):
                 ext = os.path.splitext(f)[1] or ".jpg"
@@ -898,8 +901,11 @@ def main():
             finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
             sys.exit(1)
     else:
+        dev_output = (settings_by_key.get("instagram.dev.output") or
+                      get_setting("instagram.dev.output") or
+                      os.path.join(_SCRIPT_DIR, "dev_output"))
         _logger.log("[DEV] Modo developer activo — no se publica en Instagram")
-        _logger.log(f"[DEV] Salida: {os.path.join(_SCRIPT_DIR, 'dev_output')}")
+        _logger.log(f"[DEV] Salida: {dev_output}")
 
     music_dir = settings_by_key.get("instagram.music.dir")
     if music_dir:
