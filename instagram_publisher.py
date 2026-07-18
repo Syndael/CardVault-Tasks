@@ -432,30 +432,23 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
             os.close(fd)
 
         duration = 15
+        font = os.path.exists(_FONT_FILE)
+        font_draw = f"fontfile='{_FONT_FILE}':" if font else ""
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", image_path,
-        ]
-        input_idx = 1
-        music_idx = None
-        overlay_idx = None
-        if music_path:
-            music_idx = input_idx
-            input_idx += 1
-            cmd += ["-i", music_path]
-        if overlay_path:
-            overlay_idx = input_idx
-            input_idx += 1
-            if overlay_path.lower().endswith(".gif"):
-                cmd += ["-stream_loop", "-1", "-i", overlay_path]
-            else:
-                cmd += ["-loop", "1", "-i", overlay_path]
+        text_filter = (
+            f"drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black@0.45:t=fill,"
+            f"drawtext={font_draw}text='NUEVO POST':fontcolor=white:fontsize=72:"
+            f"x=(w-text_w)/2:y=h*0.79:box=1:boxcolor=black@0.5:boxborderw=16:"
+            f"shadowcolor=black:shadowx=3:shadowy=3,"
+            f"drawtext={font_draw}text='{safe_name}':fontcolor=white:fontsize=38:"
+            f"x=(w-text_w)/2:y=h*0.87:box=1:boxcolor=black@0.5:boxborderw=10:"
+            f"shadowcolor=black:shadowx=2:shadowy=2"
+        )
 
         base_filter = (
             f"[0:v]split[bg][fg];"
             f"[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,boxblur=30:15[bg];"
+            f"crop=1080:1920,boxblur=20:10[bg];"
             f"[fg]scale=810:1440:force_original_aspect_ratio=decrease,"
             f"format=rgba,"
             f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
@@ -486,55 +479,44 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
             else:
                 ovl_x = random.randint(1080 - ovl_w - jx, 1080 - ovl_w - m)
                 ovl_y = random.randint(1920 - ovl_w - jy, 1920 - ovl_w - m)
+            ovl_input = 2 if music_path else 1
             filter_chain = (
                 f"{base_filter};"
-                f"[{overlay_idx}:v]fps=25,scale={ovl_w}:-1[ovl];"
-                f"[base][ovl]overlay={ovl_x}:{ovl_y}[v]"
+                f"[{ovl_input}:v]scale={ovl_w}:-1[ovl];"
+                f"[base][ovl]overlay={ovl_x}:{ovl_y}[with_ovl];"
+                f"[with_ovl]{text_filter}[v]"
             )
         else:
-            font = os.path.exists(_FONT_FILE)
-            if font:
-                filter_chain = (
-                    f"{base_filter};"
-                    f"[base]"
-                    f"drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black@0.45:t=fill,"
-                    f"drawtext=fontfile='{_FONT_FILE}':text='NUEVO POST':fontcolor=white:fontsize=72:"
-                    f"x=(w-text_w)/2:y=h*0.79:box=1:boxcolor=black@0.5:boxborderw=16:"
-                    f"shadowcolor=black:shadowx=3:shadowy=3,"
-                    f"drawtext=fontfile='{_FONT_FILE}':text='{safe_name}':fontcolor=white:fontsize=38:"
-                    f"x=(w-text_w)/2:y=h*0.87:box=1:boxcolor=black@0.5:boxborderw=10:"
-                    f"shadowcolor=black:shadowx=2:shadowy=2"
-                    f"[v]"
-                )
-            else:
-                filter_chain = (
-                    f"{base_filter};"
-                    f"[base]"
-                    f"drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=black@0.45:t=fill,"
-                    f"drawtext=text='NUEVO POST':fontcolor=white:fontsize=72:"
-                    f"x=(w-text_w)/2:y=h*0.79:box=1:boxcolor=black@0.5:boxborderw=16:"
-                    f"shadowcolor=black:shadowx=3:shadowy=3,"
-                    f"drawtext=text='{safe_name}':fontcolor=white:fontsize=38:"
-                    f"x=(w-text_w)/2:y=h*0.87:box=1:boxcolor=black@0.5:boxborderw=10:"
-                    f"shadowcolor=black:shadowx=2:shadowy=2"
-                    f"[v]"
-                )
+            filter_chain = f"{base_filter};[base]{text_filter}[v]"
 
-        cmd += ["-filter_complex", filter_chain,
-                "-map", "[v]"]
-
+        cmd = [
+            "ffmpeg", "-y",
+            "-threads", "2",
+            "-loop", "1", "-i", image_path,
+        ]
         if music_path:
-            cmd += ["-map", f"{music_idx}:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
+            cmd += ["-i", music_path]
+        if overlay_path:
+            if overlay_path.lower().endswith(".gif"):
+                cmd += ["-ignore_loop", "0", "-i", overlay_path]
+            else:
+                cmd += ["-loop", "1", "-i", overlay_path]
+        cmd += [
+            "-filter_complex", filter_chain,
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+            "-pix_fmt", "yuv420p", "-t", str(duration),
+            "-movflags", "+faststart",
+        ]
+        if music_path:
+            cmd += ["-map", "1:a", "-shortest", "-c:a", "aac", "-b:a", "128k"]
         else:
             cmd += ["-an"]
+        cmd += [video_path]
 
-        cmd += ["-c:v", "libx264", "-preset", "fast", "-tune", "stillimage",
-                "-pix_fmt", "yuv420p", "-t", str(duration),
-                "-movflags", "+faststart", video_path]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            _logger and _logger.log(f"  FFmpeg error: {result.stderr[-800:]}")
+            _logger and _logger.log(f"  FFmpeg error: {result.stderr[-500:]}")
             if not output_path:
                 try:
                     os.unlink(video_path)
@@ -544,6 +526,9 @@ def _create_story_video(image_path, product_name, collection_name, output_path=N
 
         if os.path.getsize(video_path) > 0:
             return video_path
+        return None
+    except subprocess.TimeoutExpired:
+        _logger and _logger.log("  FFmpeg timeout, el NAS no pudo en 10 min")
         return None
     except Exception as e:
         _logger and _logger.log(f"  FFmpeg excepcion: {e}")
