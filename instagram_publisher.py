@@ -74,6 +74,25 @@ _SETTINGS_CACHE: dict | None = None
 _SMTP_CONFIG_CACHE: dict | None = None
 _TELEGRAM_BOT_TOKEN: str | None = None
 
+_TCG_FOLDER_MAP = {
+    "Pokémon": "pokemon", "Pokemon": "pokemon", "Pokemon TCG": "pokemon",
+    "Magic": "magic", "Magic: The Gathering": "magic", "MTG": "magic",
+    "Yu-Gi-Oh!": "yugioh", "Yu-Gi-Oh": "yugioh", "YGO": "yugioh",
+    "Digimon": "digimon", "Digimon TCG": "digimon",
+    "One Piece": "onepiece", "One Piece TCG": "onepiece", "One Piece CG": "onepiece",
+    "Dragon Ball": "dragonball", "Dragon Ball Super": "dragonball", "DBS": "dragonball", "Dragon Ball CG": "dragonball",
+    "Lorcana": "lorcana", "Disney Lorcana": "lorcana",
+    "Flesh and Blood": "fab", "FAB": "fab",
+    "Weiss Schwarz": "weiss", "Weiss": "weiss",
+    "Union Arena": "unionarena",
+    "Battle Spirits": "battlespirits", "Battle Spirits Saga": "battlespirits",
+    "Cardfight": "vanguard", "Cardfight Vanguard": "vanguard", "Vanguard": "vanguard",
+    "Final Fantasy": "finalfantasy", "FFTCG": "finalfantasy",
+    "Star Wars": "starwars", "Star Wars Unlimited": "starwars",
+    "MetaZoo": "metazoo",
+    "World of Warcraft TCG": "wow", "WoW TCG": "wow",
+}
+
 _FONT_FILE: str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 _GIF_DIR: str = os.path.join(_SCRIPT_DIR, "gif")
 
@@ -264,7 +283,7 @@ def publish_instagram(cl, image_paths, caption):
         return None, None, None, str(e)
 
 
-def _pick_music(platform_name):
+def _pick_music(collection_name):
     music_dir = get_setting("instagram.music.dir") or os.getenv("IG_MUSIC_DIR")
     if not music_dir:
         return None
@@ -274,31 +293,10 @@ def _pick_music(platform_name):
         _logger and _logger.log(f"  [WARN] Directorio de musica no encontrado: {music_dir}")
         return None
 
-    platform_map = {
-        "NES": "nes", "SNES": "snes", "Super Nintendo": "snes",
-        "N64": "n64", "Nintendo 64": "n64",
-        "GameCube": "gamecube", "Wii": "wii", "Wii U": "wiiu",
-        "Switch": "switch", "Nintendo Switch": "switch",
-        "Game Boy": "gameboy", "Game Boy Color": "gameboy",
-        "Game Boy Advance": "gba", "GBA": "gba",
-        "DS": "ds", "Nintendo DS": "ds", "3DS": "3ds",
-        "PS1": "ps1", "PlayStation": "ps1",
-        "PS2": "ps2", "PlayStation 2": "ps2",
-        "PS3": "ps3", "PlayStation 3": "ps3",
-        "PS4": "ps4", "PlayStation 4": "ps4",
-        "PS5": "ps5", "PlayStation 5": "ps5",
-        "PSP": "psp", "PS Vita": "vita",
-        "Xbox": "xbox", "Xbox 360": "xbox360",
-        "Xbox One": "xbone", "Xbox Series": "xboxseries",
-        "Mega Drive": "megadrive", "Genesis": "megadrive",
-        "Dreamcast": "dreamcast", "Saturn": "saturn",
-        "PC": "pc", "Steam": "pc",
-    }
-
-    folder = platform_map.get(platform_name, "default")
+    folder = _tcg_folder(collection_name)
     search_dir = os.path.join(music_dir, folder)
     if not os.path.isdir(search_dir):
-        _logger and _logger.log(f"  Sin carpeta '{folder}' para '{platform_name}', usando default")
+        _logger and _logger.log(f"  Sin carpeta '{folder}' para '{collection_name}', usando default")
         search_dir = os.path.join(music_dir, "default")
     if not os.path.isdir(search_dir):
         search_dir = music_dir
@@ -326,13 +324,34 @@ def _pick_music(platform_name):
     return None
 
 
-def _pick_overlay():
-    if not os.path.isdir(_GIF_DIR):
+def _tcg_folder(collection_name):
+    return _TCG_FOLDER_MAP.get(collection_name, "default")
+
+
+def _pick_overlay(collection_name):
+    gif_dir = get_setting("instagram.gif.dir") or os.getenv("IG_GIF_DIR") or _GIF_DIR
+    if gif_dir.startswith("./"):
+        gif_dir = os.path.join(_SCRIPT_DIR, gif_dir[2:])
+    if not os.path.isdir(gif_dir):
         return None
 
+    folder = _tcg_folder(collection_name)
+    search_dirs = [
+        os.path.join(gif_dir, folder),
+        os.path.join(gif_dir, "default"),
+        gif_dir,
+    ]
+
     img_exts = (".gif", ".png", ".jpg", ".jpeg", ".webp")
-    candidates = [os.path.join(_GIF_DIR, f) for f in os.listdir(_GIF_DIR)
-                  if f.lower().endswith(img_exts)]
+    candidates = []
+    for sd in search_dirs:
+        if not os.path.isdir(sd):
+            continue
+        candidates = [os.path.join(sd, f) for f in os.listdir(sd)
+                      if f.lower().endswith(img_exts)]
+        if candidates:
+            break
+
     if not candidates:
         return None
 
@@ -381,13 +400,13 @@ def _generate_thumbnail(video_path):
         return None
 
 
-def _create_story_video(image_path, product_name, platform_name, output_path=None):
+def _create_story_video(image_path, product_name, collection_name, output_path=None):
     if not shutil.which("ffmpeg"):
         _logger and _logger.log("  FFmpeg no encontrado")
         return None
 
-    music_path = _pick_music(platform_name)
-    overlay_path = _pick_overlay()
+    music_path = _pick_music(collection_name)
+    overlay_path = _pick_overlay(collection_name)
     safe_name = product_name[:40].replace("'", "'\\''")
 
     try:
@@ -516,13 +535,13 @@ def _create_story_video(image_path, product_name, platform_name, output_path=Non
         return None
 
 
-def share_to_story(cl, first_image_path, product_name, platform_name):
+def share_to_story(cl, first_image_path, product_name, collection_name):
     enable_stories = get_setting("instagram.enable.stories")
     if enable_stories is not None and enable_stories.strip() in ("0", "false", "no"):
         _logger and _logger.log("  [SKIP] Stories desactivadas via config")
         return
 
-    video_path = _create_story_video(first_image_path, product_name, platform_name)
+    video_path = _create_story_video(first_image_path, product_name, collection_name)
     thumb_path = None
     if video_path:
         try:
@@ -725,11 +744,8 @@ def process_publication(pub):
         ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
 
         if ig_code:
-            collection_obj = collection if isinstance(collection, dict) else {}
-            platform_name = collection_obj.get("name") or ""
             first_image = tmp_files[0] if tmp_files else None
-
-            share_to_story(cl, first_image, product_name, platform_name)
+            share_to_story(cl, first_image, product_name, collection_name)
         else:
             error_msg = error
     except LoginRequired:
