@@ -114,6 +114,10 @@ def dt_to_str(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
 
 
+def _sanitize_mysql_text(text):
+    return "".join(c for c in text if ord(c) <= 0xFFFF)
+
+
 def get_enabled_tasks():
     data = api_get("scheduled-tasks/enabled")
     return data if data else []
@@ -147,9 +151,18 @@ def update_execution(execution_id, status, started_at=None, finished_at=None, ou
         data["finished_at"] = finished_at
     if output is not None:
         if len(output) > MAX_OUTPUT_LENGTH:
-            output = output[:MAX_OUTPUT_LENGTH] + "\n... (truncated)"
+            output = output[-MAX_OUTPUT_LENGTH:] + "\n... (truncated)"
+        output = _sanitize_mysql_text(output)
         data["output"] = output
-    api_request("PATCH", f"task-executions/{execution_id}", data)
+
+    for attempt in range(3):
+        result = api_request("PATCH", f"task-executions/{execution_id}", data)
+        if result is not None:
+            return
+        if attempt < 2:
+            log.warning("Retry %d/3 updating execution %d to '%s'", attempt + 1, execution_id, status)
+            time.sleep(2)
+    log.error("Failed to update execution %d to '%s' after 3 attempts", execution_id, status)
 
 
 def process_task(task, now):
@@ -214,7 +227,7 @@ def run_execution(execution):
         TASK_TIMEOUT = 14400
         process = subprocess.Popen(
             [sys.executable, script_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "PYTHONUNBUFFERED": "1", "CARDVAULT_TASK_EXECUTION_ID": str(exec_id)},
         )
 
@@ -226,6 +239,7 @@ def run_execution(execution):
             threading.Thread(target=_stream_output, args=(process.stderr, stderr_lines)),
         ]
         for t in threads:
+            t.daemon = True
             t.start()
 
         POLL_INTERVAL = 5
@@ -236,7 +250,7 @@ def run_execution(execution):
         while time.time() < deadline:
             for t in threads:
                 t.join(timeout=POLL_INTERVAL)
-            if not any(t.is_alive() for t in threads):
+            if process.poll() is not None and not any(t.is_alive() for t in threads):
                 break
 
             current = api_get(f"task-executions/{exec_id}")
@@ -248,15 +262,27 @@ def run_execution(execution):
             timed_out = True
 
         if cancelled or timed_out:
-            process.kill()
-        process.wait(timeout=10)
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("Process %d did not die after kill, forcing", process.pid)
+
+        for t in threads:
+            t.join(timeout=5)
 
         output = "".join(stdout_lines)
         if stderr_lines:
             output += "\n--- stderr ---\n" + "".join(stderr_lines)
 
+        if len(output) > MAX_OUTPUT_LENGTH:
+            output = output[-MAX_OUTPUT_LENGTH:] + "\n... (truncated)"
+
         if cancelled:
-            output += "\n\n--- Ejecuci\u00f3n cancelada por el usuario ---"
+            output += "\n\n--- Ejecucion cancelada por el usuario ---"
             update_execution(exec_id, "cancelled", finished_at=dt_to_str(datetime.now()), output=output)
             log.info("'%s' cancelled", task_name)
         elif timed_out:
@@ -271,6 +297,10 @@ def run_execution(execution):
             update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=output)
 
     except Exception as e:
+        try:
+            process.kill()
+        except Exception:
+            pass
         update_execution(exec_id, "error", finished_at=dt_to_str(datetime.now()), output=str(e))
         log.exception("'%s' raised exception", task_name)
 
@@ -295,7 +325,21 @@ def _start_execution(execution):
             _running_execs.pop(exec_id, None)
 
 
+def recover_orphaned_executions():
+    running = api_get("task-executions/running")
+    if not running:
+        return
+    now_str = dt_to_str(datetime.now())
+    for exc in running:
+        exec_id = exc["id"]
+        log.warning("Recovering orphaned execution %d", exec_id)
+        update_execution(exec_id, "error", finished_at=now_str,
+                         output="Orphaned execution — scheduler was restarted")
+    log.info("Recovered %d orphaned execution(s)", len(running))
+
+
 def main_loop(interval):
+    recover_orphaned_executions()
     log.info("Scheduler started (poll every %ds)", interval)
     while True:
         try:
@@ -321,7 +365,7 @@ def main_loop(interval):
                         log.info("Skipping execution %d: '%s' already running",
                                  exec_id, execution.get("scheduled_task", {}).get("name", task_id))
                         continue
-                    if len(_running_execs) >= 2:
+                    if len(_running_execs) >= 3:
                         log.info("Max concurrent executions reached, skipping remaining pending")
                         break
 

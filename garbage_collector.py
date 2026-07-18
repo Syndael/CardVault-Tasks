@@ -211,12 +211,8 @@ def get_referenced_paths(files, roots):
     return referenced, missing, remote, outside
 
 
-def iter_local_files(root, include_all_files):
-    for dirpath, _, filenames in os.walk(root):
-        for filename in filenames:
-            ext = os.path.splitext(filename)[1].lower()
-            if include_all_files or ext in IMAGE_EXTENSIONS:
-                yield real_path(os.path.join(dirpath, filename))
+def _walk_error(os_error):
+    (_logger or print)(f"  [WARN] No se pudo acceder a: {os_error}")
 
 
 def prune_empty_dirs(root, delete):
@@ -237,7 +233,7 @@ def prune_empty_dirs(root, delete):
     return removed
 
 
-def run_orphan_images_cleanup(settings, extra_paths, delete, all_files, prune, limit, verbose):
+def run_orphan_images_cleanup(settings, extra_paths, delete, all_files, prune, limit, verbose, files=None):
     _logger.log(f"\n  {'─' * 58}")
     _logger.log("  FASE 1: Archivos huérfanos (en disco sin registro en BD)")
     _logger.log(f"  {'─' * 58}")
@@ -263,25 +259,37 @@ def run_orphan_images_cleanup(settings, extra_paths, delete, all_files, prune, l
         _logger.log("  No hay directorios existentes que escanear")
         return False
 
-    _logger.log("\n  Obteniendo registros de files desde la API...")
-    files = api_get_all("files", {"per_page": 500})
+    if files is None:
+        _logger.log("\n  Obteniendo registros de files desde la API...")
+        files = api_get_all("files", {"per_page": 500})
+        _logger.log(f"  Obtenidos {len(files)} registros")
     referenced, missing, remote, outside = get_referenced_paths(files, existing_roots)
     _logger.log(f"  Registros en files:    {len(files)}")
     _logger.log(f"  Referenciados local:   {len(referenced)}")
     if missing:
-        _logger.log(f"  Sin file_path útil:    {missing}")
+        _logger.log(f"  Sin file_path util:    {missing}")
     if remote:
         _logger.log(f"  Remotos (URL):         {remote}")
     if outside:
-        _logger.log(f"  Fuera de raíces:       {outside}")
+        _logger.log(f"  Fuera de raices:       {outside}")
 
     orphan_files = []
     total_files = 0
     for root in existing_roots:
-        for local_path in iter_local_files(root, all_files):
-            total_files += 1
-            if local_path not in referenced:
-                orphan_files.append(local_path)
+        _logger.log(f"\n  Escaneando {root}...")
+        try:
+            for dirpath, _, filenames in os.walk(root, onerror=_walk_error):
+                for filename in filenames:
+                    total_files += 1
+                    if not all_files and os.path.splitext(filename)[1].lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    local_path = real_path(os.path.join(dirpath, filename))
+                    if local_path not in referenced:
+                        orphan_files.append(local_path)
+                if total_files % 10000 == 0:
+                    _logger.log(f"    Escaneados ~{total_files} archivos, {len(orphan_files)} huerfanos...")
+        except Exception as e:
+            _logger.log(f"    [ERROR] Fallo al escanear {root}: {e}")
 
     orphan_files.sort()
     _logger.log(f"\n  Archivos locales escaneados: {total_files}")
@@ -356,22 +364,26 @@ def run_old_logs_cleanup(log_dir, max_age_days, delete):
 
     if not os.path.isdir(log_dir):
         _logger.log("  El directorio no existe, se omite")
-        return
+        return True
 
     now = datetime.now().timestamp()
     cutoff = now - (max_age_days * 86400)
 
     candidates = []
-    for entry in os.listdir(log_dir):
-        full = os.path.join(log_dir, entry)
-        if not os.path.isfile(full):
-            continue
-        ext = os.path.splitext(entry)[1].lower()
-        if ext not in LOG_FILE_SUFFIXES:
-            continue
-        mtime = os.path.getmtime(full)
-        if mtime < cutoff:
-            candidates.append((entry, full, mtime))
+    try:
+        for entry in os.listdir(log_dir):
+            full = os.path.join(log_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            ext = os.path.splitext(entry)[1].lower()
+            if ext not in LOG_FILE_SUFFIXES:
+                continue
+            mtime = os.path.getmtime(full)
+            if mtime < cutoff:
+                candidates.append((entry, full, mtime))
+    except OSError as e:
+        _logger.log(f"  Error leyendo directorio de logs: {e}")
+        return False
 
     candidates.sort(key=lambda x: x[1])
 
@@ -401,8 +413,7 @@ def run_old_logs_cleanup(log_dir, max_age_days, delete):
     if not delete and candidates:
         _logger.log("  (modo dry-run. Ejecuta con --delete para eliminar)")
 
-
-# ── Orphaned DB file records ──────────────────────────────────────────
+    return True
 
 def _file_physical_path(file_record):
     fp = file_record.get("file_path")
@@ -425,13 +436,14 @@ def _file_physical_path(file_record):
     return None
 
 
-def run_orphan_db_records_cleanup(delete):
+def run_orphan_db_records_cleanup(delete, files=None):
     _logger.log(f"\n  {'─' * 58}")
     _logger.log("  FASE 3: Registros huérfanos en BD (sin archivo físico)")
     _logger.log(f"  {'─' * 58}")
 
-    _logger.log("  Obteniendo registros de files desde la API...")
-    files = api_get_all("files", {"per_page": 500})
+    if files is None:
+        _logger.log("  Obteniendo registros de files desde la API...")
+        files = api_get_all("files", {"per_page": 500})
     _logger.log(f"  Total registros en files: {len(files)}")
 
     orphaned = []
@@ -445,7 +457,7 @@ def run_orphan_db_records_cleanup(delete):
     _logger.log(f"  Registros huérfanos (sin archivo en disco): {len(orphaned)}")
 
     if not orphaned:
-        return
+        return True
 
     deleted = 0
     failed = 0
@@ -476,8 +488,7 @@ def run_orphan_db_records_cleanup(delete):
     if not delete and orphaned:
         _logger.log("  (modo dry-run. Ejecuta con --delete para eliminar)")
 
-
-# ── Main ──────────────────────────────────────────────────────────────
+    return True
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -550,23 +561,23 @@ def main():
         sys.exit(1)
 
     print(f"\n  {SEP}")
-    print("  🗑️  GARBAGE COLLECTOR")
+    print("  GARBAGE COLLECTOR")
     print(f"  {SEP}")
     print(f"  API: {API_BASE}")
     print(f"  Mode: {'DELETE' if args.delete else 'dry-run'}")
     print(f"  Fases activas:")
     if not args.skip_images:
-        print(f"    ✔ FASE 1 - Archivos huérfanos en disco")
+        print(f"    [x] FASE 1 - Archivos huerfanos en disco")
     else:
-        print(f"    ✘ FASE 1 - Omitida")
+        print(f"    [ ] FASE 1 - Omitida")
     if not args.skip_logs:
-        print(f"    ✔ FASE 2 - Logs antiguos (> {args.max_log_age} días)")
+        print(f"    [x] FASE 2 - Logs antiguos (> {args.max_log_age} dias)")
     else:
-        print(f"    ✘ FASE 2 - Omitida")
+        print(f"    [ ] FASE 2 - Omitida")
     if not args.skip_db_records:
-        print(f"    ✔ FASE 3 - Registros huérfanos en BD")
+        print(f"    [x] FASE 3 - Registros huerfanos en BD")
     else:
-        print(f"    ✘ FASE 3 - Omitida")
+        print(f"    [ ] FASE 3 - Omitida")
 
     if not _login():
         print("  Error de login")
@@ -583,26 +594,33 @@ def main():
     _logger.log(f"  Log path: {log_dir}")
 
     all_ok = True
+    cached_files = api_get_all("files", {"per_page": 500}) if (not args.skip_images or not args.skip_db_records) else []
 
     if not args.skip_images:
         ok = run_orphan_images_cleanup(
             settings, args.path, args.delete, args.all_files,
-            args.prune_empty_dirs, args.limit, args.verbose
+            args.prune_empty_dirs, args.limit, args.verbose,
+            files=cached_files
         )
         if not ok:
             all_ok = False
 
     if not args.skip_logs:
-        run_old_logs_cleanup(log_dir, args.max_log_age, args.delete)
+        ok = run_old_logs_cleanup(log_dir, args.max_log_age, args.delete)
+        if not ok:
+            all_ok = False
 
     if not args.skip_db_records:
-        run_orphan_db_records_cleanup(args.delete)
+        ok = run_orphan_db_records_cleanup(args.delete, files=cached_files)
+        if not ok:
+            all_ok = False
 
     _logger.log(f"\n  {SEP}")
     _logger.log("  GARBAGE COLLECTOR FINALIZADO")
     _logger.log(f"  {'CON ERRORES' if not all_ok else 'TODO OK'}")
     _logger.log(f"  {SEP}\n")
     finalize_log(_logger, "garbage_collector", _API_ROOT, api_request)
+    sys.exit(0 if all_ok else 1)
 
 
 if __name__ == "__main__":
@@ -610,4 +628,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n  Interrumpido")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n  Error fatal: {e}")
+        if _logger:
+            _logger.log(f"\n  ERROR FATAL: {e}")
+            finalize_log(_logger, "garbage_collector", _API_ROOT, api_request)
         sys.exit(1)

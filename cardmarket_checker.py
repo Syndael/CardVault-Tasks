@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 from task_logger import TaskLogger, finalize_log
 
 try:
-    from playwright.async_api import async_playwright
+    import nodriver as uc
 except ImportError:
-    print("Faltan dependencias. Ejecuta:\n  pip install playwright\n  playwright install chromium")
+    print("Faltan dependencias. Ejecuta:\n  pip install nodriver")
     sys.exit(1)
 
 load_dotenv()
@@ -34,10 +34,8 @@ API_PASSWORD = os.getenv("CARDVAULT_API_PASSWORD")
 _token = None
 _token_expires_at = None
 
-DELAY_MIN = 10.0
-DELAY_MAX = 18.0
-WAIT_LOAD_MS = 3000
-CLOUDFLARE_WAIT = 15000
+DELAY_MIN = 8.0
+DELAY_MAX = 14.0
 SETTING_KEY_SKIP_THRESHOLD = "cardmarket.checker.price.skip"
 SETTING_KEY_PRICE_MINUTES = "cardmarket.checker.price.minutes"
 SETTING_KEY_WISHLIST_MINUTES = "cardmarket.checker.wishlist.minutes"
@@ -171,115 +169,62 @@ def extract_price_from_html(html):
     return None
 
 
-async def human_scroll(page):
-    steps = random.randint(3, 6)
-    for _ in range(steps):
-        dist = random.randint(120, 400)
-        await page.mouse.wheel(0, dist)
-        await page.wait_for_timeout(random.randint(300, 900))
-
-
-async def human_mouse_move(page):
-    for _ in range(random.randint(2, 4)):
-        x = random.randint(200, 1100)
-        y = random.randint(150, 600)
-        await page.mouse.move(x, y, steps=random.randint(5, 15))
-        await page.wait_for_timeout(random.randint(200, 600))
-
-
-async def scrape_price(page, url):
+async def scrape_price(tab, url):
     try:
-        await page.goto(url, wait_until="networkidle", timeout=40000)
+        await tab.get(url)
     except Exception as e:
         print(f"  Error de navegacion: {e}")
         return None
-    await page.wait_for_timeout(random.randint(1500, WAIT_LOAD_MS))
-    await human_mouse_move(page)
-    await human_scroll(page)
-    await page.wait_for_timeout(random.randint(800, 2000))
-    title = await page.title()
-    body_text = await page.locator("body").inner_text()
-    cf_keywords = ["just a moment", "checking your browser", "enable javascript and cookies"]
-    if any(kw in title.lower() for kw in cf_keywords) or any(kw in body_text.lower() for kw in cf_keywords):
-        print(f"  Cloudflare detectado. Esperando {CLOUDFLARE_WAIT // 1000} s...")
-        await page.wait_for_timeout(CLOUDFLARE_WAIT)
-        title2 = await page.title()
-        if any(kw in title2.lower() for kw in cf_keywords):
-            print("  Aun bloqueado. Resuelvelo manualmente y pulsa ENTER...")
-            input()
-            await page.wait_for_timeout(2000)
+    await tab.sleep(random.uniform(1.5, 3.0))
+
     price = None
+
     try:
-        dts = await page.locator("dl dt").all()
+        dts = await tab.select_all("dl dt")
         for dt in dts:
-            txt = (await dt.inner_text()).strip().lower()
+            txt = (await dt.text).strip().lower()
             if txt in ("desde", "from", "a partir de"):
-                dd = dt.locator("~ dd")
-                if await dd.count() > 0:
-                    price = (await dd.first.inner_text()).strip()
+                dd = await dt.query_selector("~ dd")
+                if dd:
+                    price = (await dd.text).strip()
                     break
     except Exception:
         pass
+
     if not price:
         try:
-            loc = page.locator("div.price-container").first
-            if await loc.count() > 0:
-                price = (await loc.inner_text()).strip()
+            loc = await tab.select("div.price-container")
+            if loc:
+                price = (await loc.text).strip()
         except Exception:
             pass
+
     if not price:
         try:
-            spans = await page.locator("span[class*='price']").all()
+            spans = await tab.select_all("span[class*='price']")
             for span in spans:
-                txt = (await span.inner_text()).strip()
+                txt = (await span.text).strip()
                 if "€" in txt and re.search(r"\d", txt):
                     price = txt
                     break
         except Exception:
             pass
+
     if not price:
         try:
-            loc = page.locator("[itemprop='price']").first
-            if await loc.count() > 0:
-                price = (await loc.get_attribute("content")) or (await loc.inner_text()).strip()
+            loc = await tab.select("[itemprop='price']")
+            if loc:
+                price = (await loc.get_attribute("content")) or (await loc.text).strip()
         except Exception:
             pass
+
     if not price:
-        html = await page.content()
+        html = await tab.get_content()
         price = extract_price_from_html(html)
+
     if price:
         price = normalizar_precio(price)
     return price
-
-
-def find_browser_profile():
-    import platform
-    system = platform.system()
-    if system == "Windows":
-        candidates = [
-            (os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data"),
-             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
-            (os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data"), None),
-            (os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome Beta\User Data"), None),
-        ]
-    elif system == "Darwin":
-        candidates = [
-            (os.path.expanduser("~/Library/Application Support/BraveSoftware/Brave-Browser"),
-             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-            (os.path.expanduser("~/Library/Application Support/Google/Chrome"), None),
-        ]
-    else:
-        candidates = [
-            (os.path.expanduser("~/.config/BraveSoftware/Brave-Browser"),
-             "/usr/bin/brave-browser"),
-            (os.path.expanduser("~/.config/google-chrome"), None),
-        ]
-    for profile_dir, exe in candidates:
-        if os.path.isdir(profile_dir):
-            if exe and not os.path.isfile(exe):
-                exe = None
-            return profile_dir, exe
-    return None, None
 
 
 def main():
@@ -365,7 +310,6 @@ def main():
 
     _logger.log(f"  {len(items_to_check)} items de inventario con tracking de CardMarket")
 
-    # Pre-filter: descartar items con precio reciente o por debajo del umbral
     candidate_meta = []
     for item in items_to_check:
         product = item.get("product") or {}
@@ -390,7 +334,6 @@ def main():
                 "has_price": has_price, "last_price": last_price, "last_date": last_date
             })
 
-    # Ordenar: 1) sin precio, 2) precio más alto, 3) más tiempo sin actualizar
     candidate_meta.sort(key=lambda c: (
         0 if not c["has_price"] else 1,
         -(c["last_price"] if c["has_price"] else 0),
@@ -425,89 +368,98 @@ def main():
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
 
+CHROME_PATH = None
+for _base in [
+    os.path.expanduser("~/.cache/ms-playwright"),
+]:
+    if os.path.isdir(_base):
+        _versions = sorted(os.listdir(_base), reverse=True)
+        for _v in _versions:
+            _candidate = os.path.join(_base, _v, "chrome-linux64", "chrome")
+            if os.path.isfile(_candidate):
+                CHROME_PATH = _candidate
+                break
+        if CHROME_PATH:
+            break
+
+
 async def process_inventory(scrape_candidates, languages, conditions):
     global _logger
-    profile_dir, exe_path = find_browser_profile()
     SEP = "=" * 58
     total = len(scrape_candidates)
 
-    async with async_playwright() as pw:
-        context, page = await _setup_browser(pw, profile_dir, exe_path)
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        """)
+    browser = await uc.start(headless=HEADLESS, sandbox=False, browser_executable_path=CHROME_PATH)
+    tab = await browser.get("about:blank")
 
-        scraped_count = 0
-        saved_count = 0
-        error_count = 0
-        consecutive_no_price = 0
+    scraped_count = 0
+    saved_count = 0
+    error_count = 0
+    consecutive_no_price = 0
 
-        for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
-            try:
-                inv_id = item["id"]
-                inv_lang = item.get("language") or {}
-                inv_cond = item.get("condition") or {}
+    for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
+        try:
+            inv_id = item["id"]
+            inv_lang = item.get("language") or {}
+            inv_cond = item.get("condition") or {}
 
-                base_url = tr.get("url", "").strip()
-                if not base_url:
-                    continue
-
-                price_source = tr.get("price_source") or {}
-                lang_param = price_source.get("language_param")
-                cond_param = price_source.get("condition_param")
-
-                lang_code = None
-                lang_id = inv_lang.get("id")
-                if lang_id and lang_id in languages:
-                    lang_code = languages[lang_id].get("cardmarket_code")
-
-                cond_code = None
-                cond_id = inv_cond.get("id")
-                if cond_id and cond_id in conditions:
-                    cond_code = conditions[cond_id].get("cardmarket_code")
-
-                params = {}
-                if lang_param and lang_code:
-                    params[lang_param] = lang_code
-                if cond_param and cond_code:
-                    params[cond_param] = cond_code
-
-                full_url = base_url
-                if params:
-                    full_url += "?" + urllib.parse.urlencode(params)
-
-                price_str = await scrape_price(page, full_url)
-                result = await _save_inventory_price(inv_id, tr["id"], price_str, page)
-                if result:
-                    scraped_count += 1
-                    saved_count += 1
-                    consecutive_no_price = 0
-                    _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> {price_str}")
-                else:
-                    error_count += 1
-                    consecutive_no_price += 1
-                    _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> SIN PRECIO")
-                    if consecutive_no_price >= 5:
-                        _logger.log(f"  {consecutive_no_price} productos sin precio seguidos. Posible bloqueo Cloudflare. Abortando.")
-                        await context.close()
-                        sys.exit(1)
-
-                if idx < total:
-                    delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                    await asyncio.sleep(delay)
-            except Exception as e:
-                error_count += 1
-                consecutive_no_price += 1
-                _logger.log(f"  inv#? {e}")
-                if consecutive_no_price >= 5:
-                    _logger.log(f"  {consecutive_no_price} errores seguidos. Abortando.")
-                    await context.close()
-                    sys.exit(1)
+            base_url = tr.get("url", "").strip()
+            if not base_url:
                 continue
 
-        await context.close()
+            price_source = tr.get("price_source") or {}
+            lang_param = price_source.get("language_param")
+            cond_param = price_source.get("condition_param")
 
+            lang_code = None
+            lang_id = inv_lang.get("id")
+            if lang_id and lang_id in languages:
+                lang_code = languages[lang_id].get("cardmarket_code")
+
+            cond_code = None
+            cond_id = inv_cond.get("id")
+            if cond_id and cond_id in conditions:
+                cond_code = conditions[cond_id].get("cardmarket_code")
+
+            params = {}
+            if lang_param and lang_code:
+                params[lang_param] = lang_code
+            if cond_param and cond_code:
+                params[cond_param] = cond_code
+
+            full_url = base_url
+            if params:
+                full_url += "?" + urllib.parse.urlencode(params)
+
+            price_str = await scrape_price(tab, full_url)
+            result = await _save_inventory_price(inv_id, tr["id"], price_str, tab)
+            if result:
+                scraped_count += 1
+                saved_count += 1
+                consecutive_no_price = 0
+                _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> {price_str}")
+            else:
+                error_count += 1
+                consecutive_no_price += 1
+                _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> SIN PRECIO")
+                if consecutive_no_price >= 5:
+                    _logger.log(f"  {consecutive_no_price} productos sin precio seguidos. Posible bloqueo. Abortando.")
+                    browser.stop()
+                    sys.exit(1)
+
+            if idx < total:
+                delay = random.uniform(DELAY_MIN, DELAY_MAX)
+                await asyncio.sleep(delay)
+        except Exception as e:
+            error_count += 1
+            consecutive_no_price += 1
+            _logger.log(f"  inv#? {e}")
+            if consecutive_no_price >= 5:
+                _logger.log(f"  {consecutive_no_price} errores seguidos. Abortando.")
+                browser.stop()
+                sys.exit(1)
+            continue
+
+    browser.stop()
     _logger.log(f"  Procesados: {total} | OK: {scraped_count} | Errores: {error_count}")
 
 
@@ -521,117 +473,112 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
     if not items:
         return
 
-    profile_dir, exe_path = find_browser_profile()
     SEP = "=" * 58
 
-    async with async_playwright() as pw:
-        context, page = await _setup_browser(pw, profile_dir, exe_path)
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        """)
+    browser = await uc.start(headless=HEADLESS, sandbox=False, browser_executable_path=CHROME_PATH)
+    tab = await browser.get("about:blank")
 
-        scraped_count = 0
-        saved_count = 0
-        error_count = 0
-        total = len(items)
+    scraped_count = 0
+    saved_count = 0
+    error_count = 0
+    total = len(items)
 
-        for idx, wi in enumerate(items, 1):
-            prod_id = wi.get("product_id")
-            item_id = wi["id"]
-            product_number = wi.get("product_number") or ""
-            collection_code = wi.get("collection_code") or ""
-            product_name = wi.get("product_name") or ""
+    for idx, wi in enumerate(items, 1):
+        prod_id = wi.get("product_id")
+        item_id = wi["id"]
+        product_number = wi.get("product_number") or ""
+        collection_code = wi.get("collection_code") or ""
+        product_name = wi.get("product_name") or ""
 
-            tracking_list = product_tracking.get(prod_id, [])
-            if not tracking_list:
-                _logger.log(f"\n[{idx}/{total}] wish#{item_id} {product_name or product_number}: sin tracking URL, saltando")
-                continue
+        tracking_list = product_tracking.get(prod_id, [])
+        if not tracking_list:
+            _logger.log(f"\n[{idx}/{total}] wish#{item_id} {product_name or product_number}: sin tracking URL, saltando")
+            continue
 
-            wi_lang_id = wi.get("language_id")
-            wi_cond_id = wi.get("condition_id")
+        wi_lang_id = wi.get("language_id")
+        wi_cond_id = wi.get("condition_id")
 
-            for tr in tracking_list:
-                try:
-                    base_url = tr.get("url", "").strip()
-                    if not base_url:
-                        continue
-
-                    price_source = tr.get("price_source") or {}
-                    lang_param = price_source.get("language_param")
-                    cond_param = price_source.get("condition_param")
-
-                    lang_code = None
-                    if lang_param and wi_lang_id and wi_lang_id in languages:
-                        lang_code = languages[wi_lang_id].get("cardmarket_code")
-
-                    cond_code = None
-                    if cond_param and wi_cond_id and wi_cond_id in conditions:
-                        cond_code = conditions[wi_cond_id].get("cardmarket_code")
-
-                    params = {}
-                    if lang_param and lang_code:
-                        params[lang_param] = lang_code
-                    if cond_param and cond_code:
-                        params[cond_param] = cond_code
-
-                    full_url = base_url
-                    if params:
-                        full_url += "?" + urllib.parse.urlencode(params)
-
-                    product_info = f"wish#{item_id} {product_name or product_number[:50]}"
-                    _logger.log(f"\n[{idx}/{total}] {product_info}")
-                    _logger.log(f"  URL: {full_url}")
-
-                    skip = await _check_history_skip_no_inventory(item_id, tr["id"], wishlist_minutes, price_minutes)
-                    if skip:
-                        continue
-
-                    price_str = await scrape_price(page, full_url)
-
-                    if price_str and price_str != "NO_ENCONTRADO":
-                        scraped_count += 1
-                        try:
-                            new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
-                        except ValueError:
-                            _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
-                            html = await page.content()
-                            fallback = extract_price_from_html(html)
-                            if fallback:
-                                price_str = fallback
-                            else:
-                                _logger.log(f"  No se pudo recuperar precio del HTML")
-                                error_count += 1
-                                continue
-
-                        _logger.log(f"  Precio encontrado: {price_str}")
-
-                        wl_data = {
-                            "price": f"{new_price:.2f}",
-                            "source": "cardmarket",
-                        }
-                        try:
-                            r = api_post(f"wishlist-items/{item_id}/prices", wl_data)
-                            if r:
-                                saved_count += 1
-                                _logger.log(f"  Guardado en wishlist item {item_id}")
-                        except Exception as e:
-                            error_count += 1
-                            _logger.log(f"  Error al guardar en wishlist: {e}")
-                    else:
-                        error_count += 1
-                        _logger.log(f"  Precio no encontrado")
-
-                    if idx < total:
-                        delay = random.uniform(DELAY_MIN, DELAY_MAX)
-                        _logger.log(f"  Pausa {delay:.1f} s...")
-                        await asyncio.sleep(delay)
-                except Exception as e:
-                    error_count += 1
-                    _logger.log(f"  Error en enlace: {e}")
+        for tr in tracking_list:
+            try:
+                base_url = tr.get("url", "").strip()
+                if not base_url:
                     continue
 
-        await context.close()
+                price_source = tr.get("price_source") or {}
+                lang_param = price_source.get("language_param")
+                cond_param = price_source.get("condition_param")
+
+                lang_code = None
+                if lang_param and wi_lang_id and wi_lang_id in languages:
+                    lang_code = languages[wi_lang_id].get("cardmarket_code")
+
+                cond_code = None
+                if cond_param and wi_cond_id and wi_cond_id in conditions:
+                    cond_code = conditions[wi_cond_id].get("cardmarket_code")
+
+                params = {}
+                if lang_param and lang_code:
+                    params[lang_param] = lang_code
+                if cond_param and cond_code:
+                    params[cond_param] = cond_code
+
+                full_url = base_url
+                if params:
+                    full_url += "?" + urllib.parse.urlencode(params)
+
+                product_info = f"wish#{item_id} {product_name or product_number[:50]}"
+                _logger.log(f"\n[{idx}/{total}] {product_info}")
+                _logger.log(f"  URL: {full_url}")
+
+                skip = await _check_history_skip_no_inventory(item_id, tr["id"], wishlist_minutes, price_minutes)
+                if skip:
+                    continue
+
+                price_str = await scrape_price(tab, full_url)
+
+                if price_str and price_str != "NO_ENCONTRADO":
+                    scraped_count += 1
+                    try:
+                        new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+                    except ValueError:
+                        _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
+                        html = await tab.get_content()
+                        fallback = extract_price_from_html(html)
+                        if fallback:
+                            price_str = fallback
+                        else:
+                            _logger.log(f"  No se pudo recuperar precio del HTML")
+                            error_count += 1
+                            continue
+
+                    _logger.log(f"  Precio encontrado: {price_str}")
+
+                    wl_data = {
+                        "price": f"{new_price:.2f}",
+                        "source": "cardmarket",
+                    }
+                    try:
+                        r = api_post(f"wishlist-items/{item_id}/prices", wl_data)
+                        if r:
+                            saved_count += 1
+                            _logger.log(f"  Guardado en wishlist item {item_id}")
+                    except Exception as e:
+                        error_count += 1
+                        _logger.log(f"  Error al guardar en wishlist: {e}")
+                else:
+                    error_count += 1
+                    _logger.log(f"  Precio no encontrado")
+
+                if idx < total:
+                    delay = random.uniform(DELAY_MIN, DELAY_MAX)
+                    _logger.log(f"  Pausa {delay:.1f} s...")
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                error_count += 1
+                _logger.log(f"  Error en enlace: {e}")
+                continue
+
+    browser.stop()
 
     _logger.log(f"\n  {SEP}")
     _logger.log(f"  Wishlist items:  {total}")
@@ -639,43 +586,6 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
     _logger.log(f"  Guardados:       {saved_count}")
     _logger.log(f"  Errores:         {error_count}")
     _logger.log(f"  {SEP}\n")
-
-
-async def _setup_browser(pw, profile_dir, exe_path):
-    if profile_dir:
-        browser_name = "Brave" if "Brave" in profile_dir or (exe_path and "brave" in exe_path.lower()) else "Chrome"
-        _logger.log(f"\n  Usando perfil real de {browser_name}: {profile_dir}")
-        _logger.log(f"  Asegurate de tener {browser_name} CERRADO antes de continuar.\n")
-        launch_kwargs = dict(
-            user_data_dir=profile_dir,
-            headless=HEADLESS,
-            slow_mo=80,
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-            no_viewport=True,
-            locale="es-ES",
-        )
-        if exe_path:
-            launch_kwargs["executable_path"] = exe_path
-        context = await pw.chromium.launch_persistent_context(**launch_kwargs)
-        page = await context.new_page()
-    else:
-        _logger.log("\n  Brave/Chrome no encontrado. Usando Chromium sin perfil.\n")
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            slow_mo=80,
-            args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="es-ES",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = await context.new_page()
-    return context, page
 
 
 def _check_history_skip_sync(history_endpoint, filter_params, price_minutes, skip_threshold=None):
@@ -732,7 +642,7 @@ async def _check_history_skip_no_inventory(wishlist_item_id, tracking_id, wishli
     return False
 
 
-async def _save_inventory_price(inv_id, tracking_id, price_str, page):
+async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
     global _logger
     if not price_str or price_str == "NO_ENCONTRADO":
         return None
@@ -740,7 +650,7 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, page):
     try:
         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
     except ValueError:
-        html = await page.content()
+        html = await tab.get_content()
         fallback = extract_price_from_html(html)
         if fallback:
             price_str = fallback

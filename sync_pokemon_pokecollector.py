@@ -75,7 +75,7 @@ def _get_token() -> str | None:
     return _token
 
 
-def api_request(method, path, data=None):
+def api_request(method, path, data=None, _raise_http=False):
     clean_path = path.strip("/")
     if "?" in clean_path:
         clean_path, qs = clean_path.split("?", 1)
@@ -107,6 +107,8 @@ def api_request(method, path, data=None):
                     raw = resp.read().decode("utf-8")
                     return json.loads(raw) if raw else None
         (_logger or print)(f"    API {method} {path} -> HTTP {e.code}: {err_body[:300]}")
+        if _raise_http:
+            raise
         return None
     except Exception as ex:
         (_logger or print)(f"    API {method} {path} -> ERROR: {ex}")
@@ -465,22 +467,25 @@ async def main():
                         "product_type_id": card_type_id,
                         "per_page": 500
                     })
-                    existing_items = (existing or {}).get("items", [])
+                    raw_items = (existing or {}).get("items", [])
                 except Exception:
-                    existing_items = []
+                    raw_items = []
+                _logger.log(f"    [DEBUG] catalog returned {len(raw_items)} items, "
+                            f"is_manual vals={[it.get('product_is_manual') for it in raw_items[:3]]}, "
+                            f"numbers={[it.get('product_number') for it in raw_items[:3]]}")
 
                 # Filtro exacto: product_number LIKE devuelve falsos (#1 encuentra #10)
                 # Solo saltar si ya existe un producto MANUAL con ese numero
-                # El endpoint product-catalog devuelve "product_is_manual", no "is_manual"
                 def _is_manual(item):
                     val = item.get("product_is_manual")
                     return val is True or val == 1 or val == "1" or val == "true" or val == "True"
 
                 existing_items = [
-                    item for item in existing_items
+                    item for item in raw_items
                     if item.get("product_number") == card_num
                     and _is_manual(item)
                 ]
+                _logger.log(f"    [DEBUG] after filter: {len(existing_items)} match card #{card_num}")
 
                 if existing_items:
                     stats["existed"] += 1
@@ -514,7 +519,7 @@ async def main():
                             "product_number": card_num,
                             "force_download": True,
                             "is_manual": True,
-                        })
+                        }, _raise_http=True)
                         if result and result.get("id"):
                             product_id = result["id"]
                             stats["created"] += 1
@@ -522,6 +527,13 @@ async def main():
                             created = True
                             break
                         _logger.log(f"    Error creando producto (intento {attempt + 1})")
+                    except urllib.error.HTTPError as e:
+                        if e.code == 500:
+                            _logger.log(f"    Producto #{card_num} ya existe (500), saltando")
+                            stats["existed"] += 1
+                            created = True  # marcar como "procesado"
+                            break
+                        _logger.log(f"    Error HTTP creando producto: {e.code} (intento {attempt + 1})")
                     except Exception as e:
                         _logger.log(f"    Error creando producto: {e} (intento {attempt + 1})")
                     if attempt < 2:
