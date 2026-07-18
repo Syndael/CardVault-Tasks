@@ -368,7 +368,9 @@ def main():
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
 
-CHROME_PATH = None
+CHROME_PATH = os.getenv("CHROME_PATH")
+if not CHROME_PATH or not os.path.isfile(CHROME_PATH):
+    CHROME_PATH = None
 for _base in [
     os.path.expanduser("~/.cache/ms-playwright"),
 ]:
@@ -388,7 +390,7 @@ async def process_inventory(scrape_candidates, languages, conditions):
     SEP = "=" * 58
     total = len(scrape_candidates)
 
-    browser = await uc.start(headless=HEADLESS, sandbox=False, browser_executable_path=CHROME_PATH)
+    browser = await uc.start(headless=HEADLESS, no_sandbox=True, sandbox=False, browser_executable_path=CHROME_PATH)
     tab = await browser.get("about:blank")
 
     scraped_count = 0
@@ -475,7 +477,7 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
 
     SEP = "=" * 58
 
-    browser = await uc.start(headless=HEADLESS, sandbox=False, browser_executable_path=CHROME_PATH)
+    browser = await uc.start(headless=HEADLESS, no_sandbox=True, sandbox=False, browser_executable_path=CHROME_PATH)
     tab = await browser.get("about:blank")
 
     scraped_count = 0
