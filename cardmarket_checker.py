@@ -486,7 +486,6 @@ for _base in [
     "/usr/bin/google-chrome-stable",
     "/usr/lib/chromium/chromium",
     "/usr/lib/chromium-browser/chromium-browser",
-    os.path.expanduser("~/chrome-linux/chrome"),
 ]:
     if os.path.isfile(_base):
         CHROME_PATH = _base
@@ -497,7 +496,7 @@ for _base in [
         except PermissionError:
             continue
         for _v in _versions:
-            for _exe in ("chrome", "chrome-linux64/chrome", "chromium", "chrome-linux/chrome"):
+            for _exe in ("chrome", "chrome-linux/chrome", "chrome-linux64/chrome"):
                 _candidate = os.path.join(_base, _v, _exe)
                 if os.path.isfile(_candidate):
                     CHROME_PATH = _candidate
