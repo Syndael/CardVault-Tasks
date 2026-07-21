@@ -39,6 +39,14 @@ _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 
 _logger: TaskLogger | None = None
 
+_BUILD_VERSION = "unknown"
+_build_file = os.path.join(_SCRIPT_DIR, ".build_version")
+try:
+    with open(_build_file) as f:
+        _BUILD_VERSION = f.read().strip()
+except Exception:
+    pass
+
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
@@ -313,6 +321,7 @@ def main():
     log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
     _logger = TaskLogger(log_dir, "cardmarket_checker")
     _logger.log(f"  Log path: {log_dir}")
+    _logger.log(f"  Build: {_BUILD_VERSION}")
 
     skip_threshold_str = settings_by_key.get(SETTING_KEY_SKIP_THRESHOLD)
     skip_threshold = float(skip_threshold_str) if skip_threshold_str else None
