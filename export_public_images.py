@@ -182,7 +182,7 @@ def old_card_type(item):
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
-def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None):
+def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None, primary_set=None):
     data = {}
     root = os.path.abspath(public_path)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -193,16 +193,16 @@ def generate_data_js(public_path, sort_map=None, lang_map=None, cond_map=None):
         for f in filenames:
             if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
                 images.append(f)
-        if sort_map:
-            def sort_key(fname):
+        def _sort_key(fname):
+            is_primary = 0 if (primary_set and fname in primary_set) else 1
+            if sort_map:
                 inv_id = fname.split('-')[0].rsplit('__', 1)[-1]
                 key = sort_map.get(inv_id)
                 if key:
-                    return key + (inv_id,)
-                return ("", "", "", "", fname)
-            images.sort(key=sort_key)
-        else:
-            images.sort()
+                    return (is_primary,) + key + (inv_id,)
+                return (is_primary, "", "", "", "", fname)
+            return (is_primary, fname)
+        images.sort(key=_sort_key)
         data[rel] = {
             "directories": sorted(dirnames),
             "images": [os.path.join(rel, f).replace("\\", "/") for f in images]
@@ -312,6 +312,7 @@ def main():
     copied = 0
     skipped = 0
     errors = 0
+    primary_filenames = set()
 
     for inv_id, item in seen_items.items():
         product = item.get("product") or {}
@@ -373,10 +374,14 @@ def main():
                 old_path = os.path.join(target_dir, old_name)
                 if os.path.exists(dest_path):
                     skipped += 1
+                    if f.get("is_primary"):
+                        primary_filenames.add(dest_name)
                     continue
                 if os.path.exists(old_path):
                     os.rename(old_path, dest_path)
                     skipped += 1
+                    if f.get("is_primary"):
+                        primary_filenames.add(dest_name)
                     continue
 
                 file_url = resolve_url(f"/api/product-catalog/files/{file_id}/content")
@@ -393,6 +398,8 @@ def main():
                 with open(dest_path, "wb") as fh:
                     fh.write(data)
                 copied += 1
+                if f.get("is_primary"):
+                    primary_filenames.add(dest_name)
                 _logger.log(f"    [{category}/{section_name}] inv#{inv_id} file#{file_id} -> {dest_path}")
 
         product_image_url = item.get("product_image_url")
@@ -435,8 +442,8 @@ def main():
                     errors += 1
 
     _logger.log("  Generating data.js...")
-    generate_data_js(public_path, sort_map=sort_map, lang_map=lang_map, cond_map=cond_map)
-    _logger.log("  data.js updated\n")
+    generate_data_js(public_path, sort_map=sort_map, lang_map=lang_map, cond_map=cond_map, primary_set=primary_filenames)
+    _logger.log(f"  data.js updated ({len(primary_filenames)} primary images)\n")
 
     _logger.log(f"\n  {SEP}")
     _logger.log(f"  Copied: {copied}")
