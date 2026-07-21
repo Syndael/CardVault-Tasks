@@ -218,4 +218,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 instagram_poc.py
+cardmarket_checker_pro.py
 chrome_cf_profile/

@@ -510,18 +510,15 @@ CF_PROFILE_DIR = os.getenv("CARDVAULT_CF_PROFILE_DIR",
 
 
 async def _init_browser():
-    browser_args = []
-    if HEADLESS:
-        browser_args.append("--headless=new")
-    browser_args += [
+    browser_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-blink-features=AutomationControlled",
+        "--lang=es-ES",
     ]
-    if HEADLESS:
-        browser_args.append("--headless=new")
-    else:
-        browser_args.append("--disable-gpu")
 
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
 
@@ -536,6 +533,7 @@ async def _init_browser():
             ver = stdout.decode().strip() or stderr.decode().strip()
             _logger and _logger.log(f"  Chromium version: {ver}")
         browser = await uc.start(
+            headless=HEADLESS,
             browser_executable_path=CHROME_PATH,
             user_data_dir=CF_PROFILE_DIR,
             browser_args=browser_args,
