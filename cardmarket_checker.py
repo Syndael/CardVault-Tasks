@@ -25,6 +25,13 @@ try:
 except ImportError:
     pass
 
+_USE_PLAYWRIGHT = False
+try:
+    from playwright.async_api import async_playwright
+    _USE_PLAYWRIGHT = True
+except ImportError:
+    pass
+
 load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -230,6 +237,11 @@ async def scrape_price(tab, url):
 
 async def _extract_price_from_tab(tab, html):
     price = None
+    if isinstance(tab, _PWBrowserWrapper):
+        price = extract_price_from_html(html)
+        if price:
+            return normalizar_precio(price)
+        return None
 
     try:
         dts = await tab.select_all("dl dt")
@@ -540,24 +552,68 @@ async def _init_browser():
         )
         return browser
     except Exception as e:
-        _logger and _logger.log(f"  [WARN] No se pudo iniciar navegador: {e}")
-        if CHROME_PATH:
-            try:
-                cmd = [CHROME_PATH, "--no-sandbox", "--disable-gpu"]
-                if HEADLESS:
-                    cmd.append("--headless=new")
-                cmd += ["--dump-dom", "https://example.com"]
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
-                out = (stdout + stderr).decode(errors="replace")[:800]
-                _logger and _logger.log(f"  Chromium test output: {out if out.strip() else '(empty)'}")
-            except asyncio.TimeoutError:
-                _logger and _logger.log("  Chromium test: timeout (20s)")
-            except Exception as e2:
-                _logger and _logger.log(f"  Chromium test error: {e2}")
+        _logger and _logger.log(f"  [WARN] No se pudo iniciar navegador (nodriver): {e}")
+        return await _init_browser_playwright()
+
+
+async def _init_browser_playwright():
+    if not _USE_PLAYWRIGHT:
         return None
+    try:
+        _logger and _logger.log("  Intentando via Playwright...")
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--lang=es-ES",
+            ],
+        )
+        page = await browser.new_page()
+        return _PWBrowserWrapper(browser, page, pw)
+    except Exception as e:
+        _logger and _logger.log(f"  [WARN] Playwright tambien fallo: {e}")
+        return None
+
+
+class _PWBrowserWrapper:
+    def __init__(self, browser, page, pw):
+        self._browser = browser
+        self._page = page
+        self._pw = pw
+
+    async def get(self, url):
+        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        return self
+
+    async def get_content(self):
+        return await self._page.content()
+
+    async def sleep(self, seconds):
+        await asyncio.sleep(seconds)
+
+    async def select_all(self, selector):
+        return await self._page.query_selector_all(selector)
+
+    async def select(self, selector):
+        return await self._page.query_selector(selector)
+
+    async def close(self):
+        await self._page.close()
+
+    def stop(self):
+        asyncio.ensure_future(self._close_all())
+
+    async def _close_all(self):
+        try:
+            await self._browser.close()
+            await self._pw.stop()
+        except Exception:
+            pass
 
 
 _CFFI_SESSION = None
