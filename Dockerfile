@@ -15,10 +15,6 @@ VOLUME /app/chrome_cf_profile
 
 COPY . .
 
-ARG GIT_HASH=unknown
-ARG BUILD_DATE=unknown
-RUN echo "${GIT_HASH} ${BUILD_DATE}" > /app/.build_version
-
 ENV CARDVAULT_CF_PROFILE_DIR=/app/chrome_cf_profile
 ENV DISPLAY=:99
 CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x1024x24 & sleep 2 && python scheduler.py --interval 30"]

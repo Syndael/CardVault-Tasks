@@ -15,20 +15,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_BUILD_VERSION = "unknown"
-_build_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".build_version")
-try:
-    with open(_build_file) as f:
-        _BUILD_VERSION = f.read().strip()
-except Exception:
-    pass
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("scheduler")
+
+# --- VERSION --- actualizar manualmente al subir a git
+BUILD_VERSION = "v1"
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
@@ -348,7 +343,7 @@ def recover_orphaned_executions():
 
 def main_loop(interval):
     recover_orphaned_executions()
-    log.info("Scheduler started (poll every %ds)  [build %s]", interval, _BUILD_VERSION)
+    log.info("Scheduler started (poll every %ds)  [%s]", interval, BUILD_VERSION)
     while True:
         try:
             now = datetime.now()
