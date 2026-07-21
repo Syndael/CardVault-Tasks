@@ -512,20 +512,19 @@ CF_PROFILE_DIR = os.getenv("CARDVAULT_CF_PROFILE_DIR",
 
 async def _init_browser():
     browser_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,TranslateUI",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--headless=new",
         "--disable-extensions",
         "--no-first-run",
         "--disable-default-apps",
         "--disable-sync",
         "--disable-background-networking",
-        "--metrics-recording-only",
         "--disable-component-update",
-        "--disable-setuid-sandbox",
-        "--no-sandbox",
-        "--disable-gpu",
-        "--headless=new",
+        "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,TranslateUI",
+        "--disable-blink-features=AutomationControlled",
         "--lang=es-ES",
     ]
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
@@ -534,8 +533,6 @@ async def _init_browser():
         _logger and _logger.log(f"  CHROME_PATH: {CHROME_PATH or '(auto)'}")
         browser = await uc.start(
             headless=HEADLESS,
-            no_sandbox=True,
-            sandbox=False,
             browser_executable_path=CHROME_PATH,
             user_data_dir=CF_PROFILE_DIR,
             browser_args=browser_args,
