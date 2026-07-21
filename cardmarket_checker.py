@@ -203,13 +203,16 @@ CF_STRONG_PATTERNS = [
 
 def _detect_cloudflare(html_text):
     tl = html_text.strip().lower()
+    if len(tl) > 8000:
+        return False
     if len(tl) < 300 and "cloudflare" in tl:
         return True
     if len(tl) < 500 and "checking your browser" in tl:
         return True
-    for pat in CF_CHALLENGE_PATTERNS:
-        if re.search(pat, tl):
-            return True
+    if len(tl) < 3000:
+        for pat in CF_CHALLENGE_PATTERNS:
+            if re.search(pat, tl):
+                return True
     return False
 
 
@@ -520,6 +523,7 @@ async def _init_browser():
         "--disable-background-networking",
         "--metrics-recording-only",
         "--disable-component-update",
+        "--disable-setuid-sandbox",
         "--lang=es-ES",
     ]
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
@@ -541,25 +545,43 @@ async def _init_browser():
         return None
 
 
+_CFFI_SESSION = None
+
+
+def _cffi_session():
+    global _CFFI_SESSION
+    if _CFFI_SESSION is None and _USE_CFFI:
+        _CFFI_SESSION = cffi_requests.Session()
+        _CFFI_SESSION.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8,de;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        })
+    return _CFFI_SESSION
+
+
 async def _scrape_price_cffi(url):
     if not _USE_CFFI:
         return None
-    browsers = ["chrome120", "chrome124", "chrome131"]
+    session = _cffi_session()
     for attempt in range(2):
         try:
-            resp = cffi_requests.get(
+            resp = session.get(
                 url,
-                impersonate=random.choice(browsers),
+                impersonate="chrome124",
                 timeout=25,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-                    "Cache-Control": "no-cache",
-                }
             )
             if resp.status_code == 403 or _detect_cloudflare(resp.text):
                 _logger and _logger.log(f"  curl_cffi: Cloudflare detectado (intento {attempt+1})")
-                await asyncio.sleep(random.uniform(5, 10))
+                session.cookies.clear()
+                await asyncio.sleep(random.uniform(10, 20))
                 continue
             if resp.status_code != 200 or len(resp.text) < 500:
                 continue
@@ -568,7 +590,7 @@ async def _scrape_price_cffi(url):
                 return normalizar_precio(price)
         except Exception as e:
             _logger and _logger.log(f"  curl_cffi error: {e}")
-            await asyncio.sleep(random.uniform(2, 5))
+            await asyncio.sleep(random.uniform(3, 8))
     return None
 
 
