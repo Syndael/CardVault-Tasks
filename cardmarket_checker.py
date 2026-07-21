@@ -40,7 +40,7 @@ _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 _logger: TaskLogger | None = None
 
 # --- VERSION --- actualizar manualmente al subir a git
-BUILD_VERSION = "v1"
+BUILD_VERSION = "v3-nobl"
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 
@@ -575,7 +575,6 @@ async def _init_browser_playwright():
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
                 "--lang=es-ES",
             ],
         )

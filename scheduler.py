@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("scheduler")
 
 # --- VERSION --- actualizar manualmente al subir a git
-BUILD_VERSION = "v1"
+BUILD_VERSION = "v3-nobl"
 
 API_BASE = os.getenv("CARDVAULT_API_BASE")
 API_USERNAME = os.getenv("CARDVAULT_API_USERNAME")
