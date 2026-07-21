@@ -296,51 +296,64 @@ def main():
     print("Obteniendo settings...")
     settings_list = api_get_all("settings")
     settings_by_key = {item["setting_key"]: item.get("setting_value") for item in settings_list}
-    skip_threshold_str = settings_by_key.get(SETTING_KEY_SKIP_THRESHOLD)
-    skip_threshold = float(skip_threshold_str) if skip_threshold_str else None
-    if skip_threshold is not None:
-        print(f"  Umbral de salto: {skip_threshold:.2f} €")
-
-    price_minutes_str = settings_by_key.get(SETTING_KEY_PRICE_MINUTES)
-    if price_minutes_str:
-        try:
-            PRICE_MINUTES_THRESHOLD = int(price_minutes_str)
-        except ValueError:
-            PRICE_MINUTES_THRESHOLD = 10080
-    else:
-        PRICE_MINUTES_THRESHOLD = 10080
-    print(f"  Minutos umbral de precio: {PRICE_MINUTES_THRESHOLD}")
 
     log_path_setting = settings_by_key.get(SETTING_LOG_PATH, "./logs")
     log_dir = log_path_setting if os.path.isabs(log_path_setting) else os.path.join(_API_ROOT, log_path_setting)
     _logger = TaskLogger(log_dir, "cardmarket_checker")
     _logger.log(f"  Log path: {log_dir}")
 
+    skip_threshold_str = settings_by_key.get(SETTING_KEY_SKIP_THRESHOLD)
+    skip_threshold = float(skip_threshold_str) if skip_threshold_str else None
+    price_minutes_str = settings_by_key.get(SETTING_KEY_PRICE_MINUTES)
+    if price_minutes_str:
+        try: PRICE_MINUTES_THRESHOLD = int(price_minutes_str)
+        except ValueError: PRICE_MINUTES_THRESHOLD = 10080
+    else:
+        PRICE_MINUTES_THRESHOLD = 10080
+    wishlist_minutes_str = settings_by_key.get(SETTING_KEY_WISHLIST_MINUTES)
+    wishlist_minutes_threshold = int(wishlist_minutes_str) if wishlist_minutes_str else None
+
+    asyncio.run(_run_all(skip_threshold, PRICE_MINUTES_THRESHOLD, wishlist_minutes_threshold))
+
+    finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
+
+
+async def _run_all(skip_threshold, price_minutes, wishlist_minutes):
+    browser = await _init_browser()
+    tab = None
+    if browser:
+        try: tab = await browser.get("about:blank")
+        except Exception: pass
+
+    if not await _connectivity_check(browser, tab):
+        _logger.log("[ABORT] No se pudo conectar a CardMarket. Revisa la red o el navegador.")
+        if browser: 
+            try: await tab.close()
+            except Exception: pass
+            try: browser.stop()
+            except Exception: pass
+        return
+
     _logger.log("Obteniendo registros de product_price_tracking...")
     tracking_records = api_get_all("product-price-tracking")
-
     product_tracking = {}
     for tr in tracking_records:
         ps = tr.get("price_source") or {}
-        if "cardmarket" not in ps.get("name", "").lower():
-            continue
+        if "cardmarket" not in ps.get("name", "").lower(): continue
         pid = (tr.get("product") or {}).get("id")
-        if pid is None:
-            continue
+        if pid is None: continue
         product_tracking.setdefault(pid, []).append(tr)
-
     if not product_tracking:
         _logger.log("No hay productos con tracking de CardMarket")
-        finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
         return
     _logger.log(f"  {len(product_tracking)} productos con tracking de CardMarket")
 
-    wishlist_minutes_str = settings_by_key.get(SETTING_KEY_WISHLIST_MINUTES)
-    wishlist_minutes_threshold = int(wishlist_minutes_str) if wishlist_minutes_str else None
-    if wishlist_minutes_threshold is not None:
-        _logger.log(f"  Minutos salto wishlist: {wishlist_minutes_threshold}")
+    if wishlist_minutes is not None:
+        _logger.log(f"  Minutos salto wishlist: {wishlist_minutes}")
+    if skip_threshold is not None:
+        _logger.log(f"  Umbral de salto: {skip_threshold:.2f} €")
+    _logger.log(f"  Minutos umbral de precio: {price_minutes}")
 
-    # --- Inventory ---
     _logger.log("Obteniendo inventario (solo productos con tracking)...")
     inventory_items = []
     all_pids = list(product_tracking.keys())
@@ -352,8 +365,7 @@ def main():
             "per_page": 500,
             "all": "1"
         })
-        if batch:
-            inventory_items.extend(batch)
+        if batch: inventory_items.extend(batch)
 
     items_to_check = []
     for item in inventory_items:
@@ -361,7 +373,6 @@ def main():
         prod_id = product.get("id")
         if prod_id and prod_id in product_tracking:
             items_to_check.append(item)
-
     _logger.log(f"  {len(items_to_check)} items de inventario con tracking de CardMarket")
 
     candidate_meta = []
@@ -372,14 +383,12 @@ def main():
         translations = product.get("translations") or []
         prod_name = (translations[0] or {}).get("name", "") if translations else ""
         for tr in product_tracking[prod_id]:
-            if not tr.get("url", "").strip():
-                continue
+            if not tr.get("url", "").strip(): continue
             skip, prev = _check_history_skip_sync("inventory-price-history", {
                 "inventory_id": inv_id,
                 "product_price_tracking_id": tr["id"],
-            }, PRICE_MINUTES_THRESHOLD, skip_threshold)
-            if skip:
-                continue
+            }, price_minutes, skip_threshold)
+            if skip: continue
             has_price = prev is not None
             last_price = float(prev["price"]) if has_price else 0
             last_date = prev.get("recorded_at", "") if has_price else ""
@@ -394,76 +403,29 @@ def main():
         c.get("last_date") or ""
     ))
     scrape_candidates = [(c["item"], c["tr"], c["prod_name"]) for c in candidate_meta]
-
     _logger.log(f"  {len(scrape_candidates)} requieren scraping")
 
-    languages = {}
-    conditions = {}
+    languages = {lang["id"]: lang for lang in api_get_all("languages")}
+    conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
 
     if scrape_candidates:
-        _logger.log("Obteniendo idiomas...")
-        languages = {lang["id"]: lang for lang in api_get_all("languages")}
-        _logger.log("Obteniendo condiciones...")
-        conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
-
-    # --- Wishlist ---
-    if not languages or not conditions:
-        _logger.log("Obteniendo idiomas...")
-        languages = {lang["id"]: lang for lang in api_get_all("languages")}
-        _logger.log("Obteniendo condiciones...")
-        conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
+        browser, tab = await _process_inventory(scrape_candidates, languages, conditions, browser, tab)
+    else:
+        _logger.log("No hay items de inventario que requieran scraping")
 
     _logger.log("Obteniendo wishlist items...")
     wishlist_items = api_get_all("wishlist-items")
     wishlist_active = [wi for wi in wishlist_items if wi.get("w_state", "buscando") in ("buscando", "notificado")]
 
-    asyncio.run(_run_all(scrape_candidates, languages, conditions, product_tracking,
-                         wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD, wishlist_active))
-
-    finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
-
-
-async def _run_all(scrape_candidates, languages, conditions, product_tracking,
-                   wishlist_minutes, price_minutes, wishlist_active):
-    browser = await _init_browser()
-    tab = None
     try:
-        if browser:
-            tab = await browser.get("about:blank")
-            _logger.log("[OK] Navegador iniciado correctamente")
-        else:
-            _logger.log("[WARN] No se pudo iniciar navegador. Usando solo curl_cffi.")
-    except Exception as e:
-        _logger.log(f"[WARN] Error al abrir pestaña: {e}, usando solo curl_cffi")
-
-    if not await _connectivity_check(browser, tab):
-        _logger.log("[ABORT] No se pudo conectar a CardMarket. Revisa la red o el navegador.")
+        await _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
+                                languages, conditions, browser, tab, wishlist_active)
+    finally:
         if browser:
             try: await tab.close()
             except Exception: pass
             try: browser.stop()
             except Exception: pass
-            await asyncio.sleep(1)
-        return
-
-    try:
-        if scrape_candidates:
-            browser, tab = await _process_inventory(scrape_candidates, languages, conditions, browser, tab)
-        else:
-            _logger.log("No hay items de inventario que requieran scraping")
-
-        await _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
-                                languages, conditions, browser, tab, wishlist_active)
-    finally:
-        if browser:
-            try:
-                await tab.close()
-            except Exception:
-                pass
-            try:
-                browser.stop()
-            except Exception:
-                pass
             await asyncio.sleep(1)
             _logger.log("Navegador cerrado")
 
@@ -560,15 +522,12 @@ async def _init_browser():
         browser_args.append("--headless=new")
     else:
         browser_args.append("--disable-gpu")
-    display = os.environ.get("DISPLAY", "")
-    if display:
-        browser_args.append(f"--display={display}")
 
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
 
     try:
         _logger and _logger.log(f"  CHROME_PATH: {CHROME_PATH or '(auto)'}")
-        _logger and _logger.log(f"  DISPLAY: {display or '(none)'}")
+        _logger and _logger.log(f"  DISPLAY: {os.environ.get('DISPLAY', '(none)')}")
         if CHROME_PATH:
             proc = await asyncio.create_subprocess_exec(
                 CHROME_PATH, "--version",
@@ -589,8 +548,6 @@ async def _init_browser():
                 cmd = [CHROME_PATH, "--no-sandbox", "--disable-gpu"]
                 if HEADLESS:
                     cmd.append("--headless=new")
-                if display:
-                    cmd.append(f"--display={display}")
                 cmd += ["--dump-dom", "https://example.com"]
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
