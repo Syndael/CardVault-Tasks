@@ -548,7 +548,10 @@ CF_PROFILE_DIR = os.getenv("CARDVAULT_CF_PROFILE_DIR",
 
 
 async def _init_browser():
-    browser_args = [
+    browser_args = []
+    if HEADLESS:
+        browser_args.append("--headless=new")
+    browser_args += [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
