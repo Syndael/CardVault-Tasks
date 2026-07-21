@@ -18,6 +18,13 @@ except ImportError:
     print("Faltan dependencias. Ejecuta:\n  pip install nodriver")
     sys.exit(1)
 
+_USE_CFFI = False
+try:
+    from curl_cffi import requests as cffi_requests
+    _USE_CFFI = True
+except ImportError:
+    pass
+
 load_dotenv()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +43,8 @@ _token_expires_at = None
 
 DELAY_MIN = 8.0
 DELAY_MAX = 14.0
+CF_DETECTED_BACKOFF_BASE = 30.0
+CF_MAX_RETRIES_PER_URL = 3
 SETTING_KEY_SKIP_THRESHOLD = "cardmarket.checker.price.skip"
 SETTING_KEY_PRICE_MINUTES = "cardmarket.checker.price.minutes"
 SETTING_KEY_WISHLIST_MINUTES = "cardmarket.checker.wishlist.minutes"
@@ -169,25 +178,84 @@ def extract_price_from_html(html):
     return None
 
 
-async def scrape_price(tab, url):
-    try:
-        await tab.get(url)
-    except Exception as e:
-        print(f"  Error de navegacion: {e}")
-        return None
-    await tab.sleep(random.uniform(1.5, 3.0))
+CF_CHALLENGE_PATTERNS = [
+    r"just a moment",
+    r"checking your browser",
+    r"cf-browser-verification",
+    r"cf-challenge",
+    r"_cf_chl",
+    r"cf-spinner",
+    r"turnstile",
+    r"challenge-platform",
+    r"id=\"challenge",
+    r"cookies are disabled",
+]
 
+CF_STRONG_PATTERNS = [
+    r"just a moment",
+    r"checking your browser",
+    r"_cf_chl",
+    r"cf-spinner",
+    r"turnstile",
+    r"challenge-platform",
+]
+
+
+def _detect_cloudflare(html_text):
+    tl = html_text.strip().lower()
+    if len(tl) < 300 and "cloudflare" in tl:
+        return True
+    if len(tl) < 500 and "checking your browser" in tl:
+        return True
+    for pat in CF_CHALLENGE_PATTERNS:
+        if re.search(pat, tl):
+            return True
+    return False
+
+
+async def scrape_price(tab, url):
+    for cf_try in range(CF_MAX_RETRIES_PER_URL):
+        if cf_try == 0:
+            try:
+                await tab.get(url)
+            except Exception as e:
+                _logger and _logger.log(f"  Error de navegacion: {e}")
+                await tab.sleep(random.uniform(2, 5))
+                continue
+
+        await tab.sleep(random.uniform(1.5, 3.0))
+
+        html = await tab.get_content()
+        if _detect_cloudflare(html):
+            wait = 5 + cf_try * 10 + random.uniform(0, 3)
+            _logger and _logger.log(f"  Cloudflare detectado, esperando {wait:.0f}s en la pagina (intento {cf_try+1}/{CF_MAX_RETRIES_PER_URL})...")
+            await tab.sleep(wait)
+            continue
+
+        price = await _extract_price_from_tab(tab, html)
+        if price:
+            return price
+
+        await tab.sleep(random.uniform(1, 2))
+
+    return None
+
+
+async def _extract_price_from_tab(tab, html):
     price = None
 
     try:
         dts = await tab.select_all("dl dt")
         for dt in dts:
-            txt = (await dt.text).strip().lower()
-            if txt in ("desde", "from", "a partir de"):
-                dd = await dt.query_selector("~ dd")
-                if dd:
-                    price = (await dd.text).strip()
-                    break
+            try:
+                txt = (await dt.text).strip().lower()
+                if txt in ("desde", "from", "a partir de"):
+                    dd = await dt.query_selector("~ dd")
+                    if dd:
+                        price = (await dd.text).strip()
+                        break
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -219,7 +287,6 @@ async def scrape_price(tab, url):
             pass
 
     if not price:
-        html = await tab.get_content()
         price = extract_price_from_html(html)
 
     if price:
@@ -351,9 +418,6 @@ def main():
         languages = {lang["id"]: lang for lang in api_get_all("languages")}
         _logger.log("Obteniendo condiciones...")
         conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
-        asyncio.run(process_inventory(scrape_candidates, languages, conditions))
-    else:
-        _logger.log("No hay items de inventario que requieran scraping")
 
     # --- Wishlist ---
     if not languages or not conditions:
@@ -363,9 +427,48 @@ def main():
         conditions = {cond["id"]: cond for cond in api_get_all("product-conditions")}
 
     _logger.log("Obteniendo wishlist items...")
-    asyncio.run(process_wishlist(product_tracking, wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD, languages, conditions))
+    wishlist_items = api_get_all("wishlist-items")
+    wishlist_active = [wi for wi in wishlist_items if wi.get("w_state", "buscando") in ("buscando", "notificado")]
+
+    asyncio.run(_run_all(scrape_candidates, languages, conditions, product_tracking,
+                         wishlist_minutes_threshold, PRICE_MINUTES_THRESHOLD, wishlist_active))
 
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
+
+
+async def _run_all(scrape_candidates, languages, conditions, product_tracking,
+                   wishlist_minutes, price_minutes, wishlist_active):
+    browser = await _init_browser()
+    tab = None
+    try:
+        if browser:
+            tab = await browser.get("about:blank")
+            _logger.log("[OK] Navegador iniciado correctamente")
+        else:
+            _logger.log("[WARN] No se pudo iniciar navegador. Usando solo curl_cffi.")
+    except Exception as e:
+        _logger.log(f"[WARN] Error al abrir pestaña: {e}, usando solo curl_cffi")
+
+    try:
+        if scrape_candidates:
+            browser, tab = await _process_inventory(scrape_candidates, languages, conditions, browser, tab)
+        else:
+            _logger.log("No hay items de inventario que requieran scraping")
+
+        await _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
+                                languages, conditions, browser, tab, wishlist_active)
+    finally:
+        if browser:
+            try:
+                await tab.close()
+            except Exception:
+                pass
+            try:
+                browser.stop()
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            _logger.log("Navegador cerrado")
 
 
 CHROME_PATH = os.getenv("CHROME_PATH")
@@ -373,30 +476,112 @@ if not CHROME_PATH or not os.path.isfile(CHROME_PATH):
     CHROME_PATH = None
 for _base in [
     os.path.expanduser("~/.cache/ms-playwright"),
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+    "/usr/bin/google-chrome-stable",
+    "/usr/lib/chromium/chromium",
+    "/usr/lib/chromium-browser/chromium-browser",
+    os.path.expanduser("~/chrome-linux/chrome"),
 ]:
+    if os.path.isfile(_base):
+        CHROME_PATH = _base
+        break
     if os.path.isdir(_base):
-        _versions = sorted(os.listdir(_base), reverse=True)
+        try:
+            _versions = sorted(os.listdir(_base), reverse=True)
+        except PermissionError:
+            continue
         for _v in _versions:
-            _candidate = os.path.join(_base, _v, "chrome-linux64", "chrome")
-            if os.path.isfile(_candidate):
-                CHROME_PATH = _candidate
+            for _exe in ("chrome", "chrome-linux64/chrome", "chromium", "chrome-linux/chrome"):
+                _candidate = os.path.join(_base, _v, _exe)
+                if os.path.isfile(_candidate):
+                    CHROME_PATH = _candidate
+                    break
+            if CHROME_PATH:
                 break
         if CHROME_PATH:
             break
 
+CF_PROFILE_DIR = os.getenv("CARDVAULT_CF_PROFILE_DIR",
+                            os.path.join(_SCRIPT_DIR, "chrome_cf_profile"))
 
-async def process_inventory(scrape_candidates, languages, conditions):
+
+async def _init_browser():
+    browser_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,TranslateUI",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--no-first-run",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--metrics-recording-only",
+        "--disable-component-update",
+        "--lang=es-ES",
+    ]
+    os.makedirs(CF_PROFILE_DIR, exist_ok=True)
+
+    try:
+        _logger and _logger.log(f"  CHROME_PATH: {CHROME_PATH or '(auto)'}")
+        browser = await uc.start(
+            headless=HEADLESS,
+            no_sandbox=True,
+            sandbox=False,
+            browser_executable_path=CHROME_PATH,
+            user_data_dir=CF_PROFILE_DIR,
+            browser_args=browser_args,
+        )
+        return browser
+    except Exception as e:
+        _logger and _logger.log(f"  [WARN] No se pudo iniciar navegador: {e}")
+        _logger and _logger.log(f"  [INFO] Instala chromium o chrome en el sistema.")
+        return None
+
+
+async def _scrape_price_cffi(url):
+    if not _USE_CFFI:
+        return None
+    browsers = ["chrome120", "chrome124", "chrome131"]
+    for attempt in range(2):
+        try:
+            resp = cffi_requests.get(
+                url,
+                impersonate=random.choice(browsers),
+                timeout=25,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                }
+            )
+            if resp.status_code == 403 or _detect_cloudflare(resp.text):
+                _logger and _logger.log(f"  curl_cffi: Cloudflare detectado (intento {attempt+1})")
+                await asyncio.sleep(random.uniform(5, 10))
+                continue
+            if resp.status_code != 200 or len(resp.text) < 500:
+                continue
+            price = extract_price_from_html(resp.text)
+            if price:
+                return normalizar_precio(price)
+        except Exception as e:
+            _logger and _logger.log(f"  curl_cffi error: {e}")
+            await asyncio.sleep(random.uniform(2, 5))
+    return None
+
+
+async def _process_inventory(scrape_candidates, languages, conditions, browser, tab):
     global _logger
     SEP = "=" * 58
     total = len(scrape_candidates)
-
-    browser = await uc.start(headless=HEADLESS, no_sandbox=True, sandbox=False, browser_executable_path=CHROME_PATH)
-    tab = await browser.get("about:blank")
 
     scraped_count = 0
     saved_count = 0
     error_count = 0
     consecutive_no_price = 0
+    consecutive_errors = 0
 
     for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
         try:
@@ -432,21 +617,47 @@ async def process_inventory(scrape_candidates, languages, conditions):
             if params:
                 full_url += "?" + urllib.parse.urlencode(params)
 
-            price_str = await scrape_price(tab, full_url)
+            price_str = None
+            if tab is not None and browser is not None:
+                price_str = await scrape_price(tab, full_url)
+
+            if not price_str and _USE_CFFI:
+                _logger and _logger.log(f"  Intentando con curl_cffi...")
+                price_str = await _scrape_price_cffi(full_url)
+
             result = await _save_inventory_price(inv_id, tr["id"], price_str, tab)
             if result:
                 scraped_count += 1
                 saved_count += 1
                 consecutive_no_price = 0
+                consecutive_errors = 0
                 _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> {price_str}")
             else:
                 error_count += 1
                 consecutive_no_price += 1
                 _logger.log(f"  inv#{inv_id} {prod_name[:50]} -> SIN PRECIO")
-                if consecutive_no_price >= 5:
-                    _logger.log(f"  {consecutive_no_price} productos sin precio seguidos. Posible bloqueo. Abortando.")
-                    browser.stop()
-                    sys.exit(1)
+                if consecutive_no_price >= 15 and browser is not None:
+                    _logger.log(f"  {consecutive_no_price} productos sin precio seguidos. Bloqueo probable.")
+                    _logger.log(f"  Cerrando y reiniciando navegador...")
+                    try:
+                        await tab.close()
+                    except Exception:
+                        pass
+                    try:
+                        browser.stop()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(random.uniform(10, 20))
+                    browser = await _init_browser()
+                    if browser:
+                        tab = await browser.get("about:blank")
+                    else:
+                        tab = None
+                    consecutive_no_price = 0
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        _logger.log("  Demasiados reinicios sin exito. Abortando.")
+                        return browser, tab
 
             if idx < total:
                 delay = random.uniform(DELAY_MIN, DELAY_MAX)
@@ -455,30 +666,43 @@ async def process_inventory(scrape_candidates, languages, conditions):
             error_count += 1
             consecutive_no_price += 1
             _logger.log(f"  inv#? {e}")
-            if consecutive_no_price >= 5:
-                _logger.log(f"  {consecutive_no_price} errores seguidos. Abortando.")
-                browser.stop()
-                sys.exit(1)
+            if consecutive_no_price >= 15 and browser is not None:
+                _logger.log(f"  {consecutive_no_price} errores seguidos. Reiniciando navegador...")
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+                try:
+                    browser.stop()
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(10, 20))
+                browser = await _init_browser()
+                if browser:
+                    tab = await browser.get("about:blank")
+                else:
+                    tab = None
+                consecutive_no_price = 0
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    _logger.log("  Demasiados reinicios. Abortando.")
+                    return browser, tab
             continue
 
-    browser.stop()
     _logger.log(f"  Procesados: {total} | OK: {scraped_count} | Errores: {error_count}")
+    return browser, tab
 
 
-async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, languages, conditions):
+async def _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
+                             languages, conditions, browser, tab, wishlist_active):
     global _logger
-    _logger.log("Obteniendo wishlist items activos...")
-    wishlist_items = api_get_all("wishlist-items")
-    items = [wi for wi in wishlist_items if wi.get("w_state", "buscando") in ("buscando", "notificado")]
+    items = wishlist_active
     _logger.log(f"  {len(items)} items en wishlist con estado 'buscando' o 'notificado'")
 
     if not items:
         return
 
     SEP = "=" * 58
-
-    browser = await uc.start(headless=HEADLESS, no_sandbox=True, sandbox=False, browser_executable_path=CHROME_PATH)
-    tab = await browser.get("about:blank")
 
     scraped_count = 0
     saved_count = 0
@@ -536,20 +760,32 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
                 if skip:
                     continue
 
-                price_str = await scrape_price(tab, full_url)
+                price_str = None
+                if tab is not None and browser is not None:
+                    price_str = await scrape_price(tab, full_url)
+
+                if not price_str and _USE_CFFI:
+                    _logger.log(f"  Intentando con curl_cffi...")
+                    price_str = await _scrape_price_cffi(full_url)
 
                 if price_str and price_str != "NO_ENCONTRADO":
                     scraped_count += 1
                     try:
                         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
                     except ValueError:
-                        _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer 'From' del HTML...")
-                        html = await tab.get_content()
-                        fallback = extract_price_from_html(html)
-                        if fallback:
-                            price_str = fallback
+                        _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer del HTML...")
+                        if tab is not None:
+                            html = await tab.get_content()
+                            fallback = extract_price_from_html(html)
+                            if fallback:
+                                price_str = fallback
+                                new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+                            else:
+                                _logger.log(f"  No se pudo recuperar precio del HTML")
+                                error_count += 1
+                                continue
                         else:
-                            _logger.log(f"  No se pudo recuperar precio del HTML")
+                            _logger.log(f"  No se pudo recuperar precio (sin navegador)")
                             error_count += 1
                             continue
 
@@ -579,8 +815,6 @@ async def process_wishlist(product_tracking, wishlist_minutes, price_minutes, la
                 error_count += 1
                 _logger.log(f"  Error en enlace: {e}")
                 continue
-
-    browser.stop()
 
     _logger.log(f"\n  {SEP}")
     _logger.log(f"  Wishlist items:  {total}")
@@ -652,11 +886,14 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
     try:
         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
     except ValueError:
-        html = await tab.get_content()
-        fallback = extract_price_from_html(html)
-        if fallback:
-            price_str = fallback
-            new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+        if tab is not None:
+            html = await tab.get_content()
+            fallback = extract_price_from_html(html)
+            if fallback:
+                price_str = fallback
+                new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
+            else:
+                return None
         else:
             return None
 

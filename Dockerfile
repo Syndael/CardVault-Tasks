@@ -14,7 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
     && playwright install --with-deps chromium-headless-shell
 
+# Directorio persistente para perfil de navegador (Cloudflare cookies/fingerprint)
+RUN mkdir -p /app/chrome_cf_profile
+VOLUME /app/chrome_cf_profile
+
 COPY . .
 
 ENV CHROME_PATH=/usr/bin/chromium
+ENV CARDVAULT_CF_PROFILE_DIR=/app/chrome_cf_profile
 CMD ["python", "scheduler.py", "--interval", "30"]
