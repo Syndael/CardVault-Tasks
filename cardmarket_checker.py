@@ -524,6 +524,9 @@ async def _init_browser():
         "--metrics-recording-only",
         "--disable-component-update",
         "--disable-setuid-sandbox",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--headless=new",
         "--lang=es-ES",
     ]
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
@@ -564,6 +567,10 @@ def _cffi_session():
             "Sec-Fetch-User": "?1",
             "Cache-Control": "max-age=0",
         })
+        try:
+            _CFFI_SESSION.get("https://www.cardmarket.com/en", impersonate="chrome124", timeout=15)
+        except Exception:
+            pass
     return _CFFI_SESSION
 
 
@@ -571,15 +578,18 @@ async def _scrape_price_cffi(url):
     if not _USE_CFFI:
         return None
     session = _cffi_session()
-    for attempt in range(2):
+    browsers = ["chrome124", "chrome131", "safari17_0"]
+    for attempt in range(3):
         try:
+            imp = browsers[attempt % len(browsers)]
             resp = session.get(
                 url,
-                impersonate="chrome124",
+                impersonate=imp,
                 timeout=25,
+                headers={"Referer": "https://www.cardmarket.com/"},
             )
             if resp.status_code == 403 or _detect_cloudflare(resp.text):
-                _logger and _logger.log(f"  curl_cffi: Cloudflare detectado (intento {attempt+1})")
+                _logger and _logger.log(f"  curl_cffi({imp}): Cloudflare detectado (intento {attempt+1})")
                 session.cookies.clear()
                 await asyncio.sleep(random.uniform(10, 20))
                 continue
