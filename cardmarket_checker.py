@@ -181,57 +181,40 @@ def extract_price_from_html(html):
 CF_CHALLENGE_PATTERNS = [
     r"just a moment",
     r"checking your browser",
-    r"cf-browser-verification",
-    r"cf-challenge",
     r"_cf_chl",
     r"cf-spinner",
-    r"turnstile",
-    r"challenge-platform",
     r"id=\"challenge",
     r"cookies are disabled",
-]
-
-CF_STRONG_PATTERNS = [
-    r"just a moment",
-    r"checking your browser",
-    r"_cf_chl",
-    r"cf-spinner",
-    r"turnstile",
-    r"challenge-platform",
 ]
 
 
 def _detect_cloudflare(html_text):
     tl = html_text.strip().lower()
-    if len(tl) > 8000:
+    if len(tl) > 10000:
         return False
-    if len(tl) < 300 and "cloudflare" in tl:
+    if "cloudflare" in tl and len(tl) < 8000:
         return True
-    if len(tl) < 500 and "checking your browser" in tl:
-        return True
-    if len(tl) < 3000:
-        for pat in CF_CHALLENGE_PATTERNS:
-            if re.search(pat, tl):
+    for pat in CF_CHALLENGE_PATTERNS:
+        if re.search(pat, tl):
+            if len(tl) < 8000:
                 return True
     return False
 
 
 async def scrape_price(tab, url):
     for cf_try in range(CF_MAX_RETRIES_PER_URL):
-        if cf_try == 0:
-            try:
-                await tab.get(url)
-            except Exception as e:
-                _logger and _logger.log(f"  Error de navegacion: {e}")
-                await tab.sleep(random.uniform(2, 5))
-                continue
-
-        await tab.sleep(random.uniform(1.5, 3.0))
+        try:
+            await tab.get(url)
+            await tab.sleep(3)
+        except Exception as e:
+            _logger and _logger.log(f"    Error de navegacion: {e}")
+            await tab.sleep(random.uniform(2, 5))
+            continue
 
         html = await tab.get_content()
         if _detect_cloudflare(html):
             wait = 5 + cf_try * 10 + random.uniform(0, 3)
-            _logger and _logger.log(f"  Cloudflare detectado, esperando {wait:.0f}s en la pagina (intento {cf_try+1}/{CF_MAX_RETRIES_PER_URL})...")
+            _logger and _logger.log(f"  Cloudflare detectado, esperando {wait:.0f}s...")
             await tab.sleep(wait)
             continue
 
@@ -239,7 +222,8 @@ async def scrape_price(tab, url):
         if price:
             return price
 
-        await tab.sleep(random.uniform(1, 2))
+        if cf_try < CF_MAX_RETRIES_PER_URL - 1:
+            await tab.sleep(random.uniform(2, 4))
 
     return None
 
@@ -452,6 +436,16 @@ async def _run_all(scrape_candidates, languages, conditions, product_tracking,
     except Exception as e:
         _logger.log(f"[WARN] Error al abrir pestaña: {e}, usando solo curl_cffi")
 
+    if not await _connectivity_check(browser, tab):
+        _logger.log("[ABORT] No se pudo conectar a CardMarket. Revisa la red o el navegador.")
+        if browser:
+            try: await tab.close()
+            except Exception: pass
+            try: browser.stop()
+            except Exception: pass
+            await asyncio.sleep(1)
+        return
+
     try:
         if scrape_candidates:
             browser, tab = await _process_inventory(scrape_candidates, languages, conditions, browser, tab)
@@ -472,6 +466,49 @@ async def _run_all(scrape_candidates, languages, conditions, product_tracking,
                 pass
             await asyncio.sleep(1)
             _logger.log("Navegador cerrado")
+
+
+CM_HOME = "https://www.cardmarket.com/en"
+
+
+async def _connectivity_check(browser, tab):
+    _logger.log(f"\n  Verificando conectividad con CardMarket...")
+
+    if tab is not None and browser is not None:
+        try:
+            await tab.get(CM_HOME)
+            await tab.sleep(5)
+            html = await tab.get_content()
+            _logger.log(f"  HTML: {len(html)} bytes, CF={_detect_cloudflare(html)}")
+            if _detect_cloudflare(html):
+                _logger.log("  Cloudflare detectado, esperando resolucion...")
+                await tab.sleep(15)
+                html = await tab.get_content()
+                _logger.log(f"  HTML tras espera: {len(html)} bytes, CF={_detect_cloudflare(html)}")
+            if len(html) > 10000 and not _detect_cloudflare(html):
+                _logger.log(f"  [OK] Navegador: conectado ({len(html)} bytes)")
+                return True
+            if _detect_cloudflare(html):
+                _logger.log(f"  [FAIL] Cloudflare persiste tras 20s")
+                return False
+            _logger.log(f"  [WARN] Pagina inusual ({len(html)} bytes)")
+        except Exception as e:
+            _logger.log(f"  [FAIL] Navegador: {e}")
+
+    if _USE_CFFI:
+        _logger.log("  Probando via curl_cffi...")
+        try:
+            session = _cffi_session()
+            resp = session.get(CM_HOME, impersonate="chrome124", timeout=20)
+            if resp.status_code == 200 and len(resp.text) > 2000 and not _detect_cloudflare(resp.text):
+                _logger.log(f"  [OK] curl_cffi: conectado ({len(resp.text)} bytes)")
+                return True
+            _logger.log(f"  [FAIL] curl_cffi: status={resp.status_code} len={len(resp.text)} cf={_detect_cloudflare(resp.text)}")
+        except Exception as e:
+            _logger.log(f"  [FAIL] curl_cffi: {e}")
+
+    _logger.log(f"  [FAIL] Ningun metodo pudo conectar a CardMarket")
+    return False
 
 
 CHROME_PATH = os.getenv("CHROME_PATH")
@@ -511,28 +548,26 @@ CF_PROFILE_DIR = os.getenv("CARDVAULT_CF_PROFILE_DIR",
 
 
 async def _init_browser():
-    browser_args = [
+    browser_args = []
+    if HEADLESS:
+        browser_args.append("--headless=new")
+    browser_args += [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--headless=new",
-        "--disable-extensions",
-        "--no-first-run",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,TranslateUI",
-        "--disable-blink-features=AutomationControlled",
-        "--lang=es-ES",
     ]
     os.makedirs(CF_PROFILE_DIR, exist_ok=True)
 
     try:
         _logger and _logger.log(f"  CHROME_PATH: {CHROME_PATH or '(auto)'}")
+        if CHROME_PATH:
+            proc = await asyncio.create_subprocess_exec(
+                CHROME_PATH, "--version",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
+            ver = stdout.decode().strip() or stderr.decode().strip()
+            _logger and _logger.log(f"  Chromium version: {ver}")
         browser = await uc.start(
-            headless=HEADLESS,
             browser_executable_path=CHROME_PATH,
             user_data_dir=CF_PROFILE_DIR,
             browser_args=browser_args,
@@ -541,6 +576,17 @@ async def _init_browser():
     except Exception as e:
         _logger and _logger.log(f"  [WARN] No se pudo iniciar navegador: {e}")
         _logger and _logger.log(f"  [INFO] Instala chromium o chrome en el sistema.")
+        if CHROME_PATH:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    CHROME_PATH, "--no-sandbox", "--headless=new", "--disable-gpu",
+                    "--dump-dom", "https://example.com",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                out = (stdout + stderr).decode(errors="replace")[:800]
+                _logger and _logger.log(f"  Chromium test output:\n{out}")
+            except Exception as e2:
+                _logger and _logger.log(f"  Chromium test error: {e2}")
         return None
 
 
@@ -614,6 +660,7 @@ async def _process_inventory(scrape_candidates, languages, conditions, browser, 
     for idx, (item, tr, prod_name) in enumerate(scrape_candidates, 1):
         try:
             inv_id = item["id"]
+            _logger and _logger.log(f"\n[{idx}/{total}] inv#{inv_id} {prod_name[:50]}")
             inv_lang = item.get("language") or {}
             inv_cond = item.get("condition") or {}
 
