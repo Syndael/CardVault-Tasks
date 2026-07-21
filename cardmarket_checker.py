@@ -571,7 +571,9 @@ async def _init_browser_playwright():
     try:
         _logger and _logger.log("  Intentando via Playwright...")
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
+        os.makedirs(CF_PROFILE_DIR, exist_ok=True)
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=CF_PROFILE_DIR,
             headless=HEADLESS,
             args=[
                 "--no-sandbox",
@@ -582,21 +584,21 @@ async def _init_browser_playwright():
                 "--lang=es-ES",
             ],
         )
-        page = await browser.new_page()
-        return _PWBrowserWrapper(browser, page, pw)
+        page = context.pages[0] if context.pages else await context.new_page()
+        return _PWBrowserWrapper(context, page, pw)
     except Exception as e:
         _logger and _logger.log(f"  [WARN] Playwright tambien fallo: {e}")
         return None
 
 
 class _PWBrowserWrapper:
-    def __init__(self, browser, page, pw):
-        self._browser = browser
+    def __init__(self, context, page, pw):
+        self._context = context
         self._page = page
         self._pw = pw
 
     async def get(self, url):
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await self._page.goto(url, wait_until="load", timeout=45000)
         return self
 
     async def get_content(self):
@@ -619,7 +621,7 @@ class _PWBrowserWrapper:
 
     async def _close_all(self):
         try:
-            await self._browser.close()
+            await self._context.close()
             await self._pw.stop()
         except Exception:
             pass
