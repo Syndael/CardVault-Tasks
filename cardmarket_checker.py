@@ -40,7 +40,7 @@ _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 _logger: TaskLogger | None = None
 
 # --- VERSION --- actualizar manualmente al subir a git
-BUILD_VERSION = "v3-nobl"
+BUILD_VERSION = "v4-preview"
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 
@@ -58,6 +58,7 @@ CF_MAX_RETRIES_PER_URL = 3
 SETTING_KEY_SKIP_THRESHOLD = "cardmarket.checker.price.skip"
 SETTING_KEY_PRICE_MINUTES = "cardmarket.checker.price.minutes"
 SETTING_KEY_WISHLIST_MINUTES = "cardmarket.checker.wishlist.minutes"
+SETTING_KEY_PRIORITY_THRESHOLD = "cardmarket.checker.price.priority_threshold"
 SETTING_LOG_PATH = "tasks.log.path"
 
 
@@ -328,13 +329,15 @@ def main():
         PRICE_MINUTES_THRESHOLD = 10080
     wishlist_minutes_str = settings_by_key.get(SETTING_KEY_WISHLIST_MINUTES)
     wishlist_minutes_threshold = int(wishlist_minutes_str) if wishlist_minutes_str else None
+    priority_threshold_str = settings_by_key.get(SETTING_KEY_PRIORITY_THRESHOLD)
+    priority_threshold = float(priority_threshold_str) if priority_threshold_str else None
 
-    asyncio.run(_run_all(skip_threshold, PRICE_MINUTES_THRESHOLD, wishlist_minutes_threshold))
+    asyncio.run(_run_all(skip_threshold, PRICE_MINUTES_THRESHOLD, wishlist_minutes_threshold, priority_threshold))
 
     finalize_log(_logger, "cardmarket_checker", _API_ROOT, api_request)
 
 
-async def _run_all(skip_threshold, price_minutes, wishlist_minutes):
+async def _run_all(skip_threshold, price_minutes, wishlist_minutes, priority_threshold):
     browser = await _init_browser()
     tab = None
     if browser:
@@ -368,6 +371,8 @@ async def _run_all(skip_threshold, price_minutes, wishlist_minutes):
         _logger.log(f"  Minutos salto wishlist: {wishlist_minutes}")
     if skip_threshold is not None:
         _logger.log(f"  Umbral de salto: {skip_threshold:.2f} €")
+    if priority_threshold is not None:
+        _logger.log(f"  Umbral de prioridad: {priority_threshold:.2f} €")
     _logger.log(f"  Minutos umbral de precio: {price_minutes}")
 
     _logger.log("Obteniendo inventario (solo productos con tracking)...")
@@ -413,11 +418,18 @@ async def _run_all(skip_threshold, price_minutes, wishlist_minutes):
                 "has_price": has_price, "last_price": last_price, "last_date": last_date
             })
 
-    candidate_meta.sort(key=lambda c: (
-        0 if not c["has_price"] else 1,
-        -(c["last_price"] if c["has_price"] else 0),
-        c.get("last_date") or ""
-    ))
+    if priority_threshold is not None:
+        candidate_meta.sort(key=lambda c: (
+            0 if not c["has_price"] else (1 if c["last_price"] >= priority_threshold else 2),
+            -(c["last_price"] if c["has_price"] else 0),
+            c.get("last_date") or ""
+        ))
+    else:
+        candidate_meta.sort(key=lambda c: (
+            0 if not c["has_price"] else 1,
+            -(c["last_price"] if c["has_price"] else 0),
+            c.get("last_date") or ""
+        ))
     scrape_candidates = [(c["item"], c["tr"], c["prod_name"]) for c in candidate_meta]
     _logger.log(f"  {len(scrape_candidates)} requieren scraping")
 
@@ -455,12 +467,13 @@ async def _connectivity_check(browser, tab):
     if tab is not None and browser is not None:
         try:
             await tab.get(CM_HOME)
-            await tab.sleep(5)
+            await tab.sleep(8)
             html = await tab.get_content()
             _logger.log(f"  HTML: {len(html)} bytes, CF={_detect_cloudflare(html)}")
             if _detect_cloudflare(html):
                 _logger.log("  Cloudflare detectado, esperando resolucion...")
-                await tab.sleep(15)
+                _logger.log(f"  HTML preview: {html[:200]}")
+                await tab.sleep(25)
                 html = await tab.get_content()
                 _logger.log(f"  HTML tras espera: {len(html)} bytes, CF={_detect_cloudflare(html)}")
             if len(html) > 10000 and not _detect_cloudflare(html):
@@ -1003,57 +1016,80 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
         else:
             return None
 
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
     history_records = api_get_all("inventory-price-history", {
         "inventory_id": inv_id,
         "product_price_tracking_id": tracking_id,
     })
-    prev = max(history_records, key=lambda r: r.get("recorded_at", "")) if history_records else None
+    prev = history_records[0] if history_records else None
 
     if prev is not None:
+        prev_id = prev["id"]
         prev_price = float(prev["price"])
-        if abs(new_price - prev_price) < 0.001:
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-            try:
-                result = api_request("PATCH", f"inventory-price-history/{prev['id']}", {"recorded_at": now_str})
-                if result:
-                    return result
-            except Exception as e:
-                _logger.log(f"  Error al actualizar timestamp: {e}")
-            return prev
+        prev_min = float(prev["min_price"]) if prev.get("min_price") is not None else prev_price
+        prev_max = float(prev["max_price"]) if prev.get("max_price") is not None else prev_price
 
-    if prev is None:
-        min_price = new_price
-        max_price = new_price
-        min_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        max_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        patch_data = {"price": f"{new_price:.2f}", "recorded_at": now_str}
+
+        current_min = prev_min
+        current_max = prev_max
+        current_min_date = prev.get("min_price_recorded_at")
+        current_max_date = prev.get("max_price_recorded_at")
+
+        if new_price < prev_min:
+            patch_data["min_price"] = f"{new_price:.2f}"
+            patch_data["min_price_recorded_at"] = now_str
+            current_min = new_price
+            current_min_date = now_str
+
+        if new_price > prev_max:
+            patch_data["max_price"] = f"{new_price:.2f}"
+            patch_data["max_price_recorded_at"] = now_str
+            current_max = new_price
+            current_max_date = now_str
+
+        try:
+            result = api_request("PATCH", f"inventory-price-history/{prev_id}", patch_data)
+        except Exception as e:
+            _logger.log(f"  Error al actualizar registro: {e}")
+            result = None
     else:
-        prev_min = float(prev["min_price"]) if prev.get("min_price") else prev_price
-        prev_max = float(prev["max_price"]) if prev.get("max_price") else prev_price
+        current_min = new_price
+        current_max = new_price
+        current_min_date = now_str
+        current_max_date = now_str
 
-        min_price = min(new_price, prev_min, prev_price)
-        max_price = max(new_price, prev_max, prev_price)
+        post_data = {
+            "inventory_id": inv_id,
+            "product_price_tracking_id": tracking_id,
+            "price": f"{new_price:.2f}",
+            "min_price": f"{new_price:.2f}",
+            "max_price": f"{new_price:.2f}",
+            "min_price_recorded_at": now_str,
+            "max_price_recorded_at": now_str,
+        }
+        try:
+            result = api_post("inventory-price-history", post_data)
+        except Exception as e:
+            _logger.log(f"  Error al crear registro: {e}")
+            result = None
 
-        min_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                    if min_price != prev_min
-                    else prev.get("min_price_recorded_at"))
-        max_date = (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                    if max_price != prev_max
-                    else prev.get("max_price_recorded_at"))
-
-    post_data = {
+    archive_data = {
         "inventory_id": inv_id,
         "product_price_tracking_id": tracking_id,
         "price": f"{new_price:.2f}",
-        "min_price": f"{min_price:.2f}",
-        "max_price": f"{max_price:.2f}",
-        "min_price_recorded_at": min_date,
-        "max_price_recorded_at": max_date,
+        "min_price": f"{current_min:.2f}",
+        "max_price": f"{current_max:.2f}",
+        "min_price_recorded_at": current_min_date,
+        "max_price_recorded_at": current_max_date,
     }
     try:
-        result = api_post("inventory-price-history", post_data)
-        return result
+        api_post("inventory-price-history-archive", archive_data)
     except Exception as e:
-        return None
+        _logger.log(f"  Error al archivar traza: {e}")
+
+    return result
 
 
 if __name__ == "__main__":

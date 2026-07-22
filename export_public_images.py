@@ -367,20 +367,33 @@ def main():
             for f in inv_files:
                 file_id = f["id"]
                 ext = get_extension(f.get("original_name", ""), f.get("file_path", ""))
-                dest_name = f"{sort_prefix}{inv_id}-{file_id}{ext}"
+                is_primary = f.get("is_primary", False)
+
+                file_tag = "000" if is_primary else str(file_id)
+                dest_name = f"{sort_prefix}{inv_id}-{file_tag}{ext}"
                 dest_path = os.path.join(target_dir, dest_name)
 
                 old_name = f"{inv_id}-{file_id}{ext}"
                 old_path = os.path.join(target_dir, old_name)
+
+                alt_name = f"{sort_prefix}{inv_id}-{file_id}{ext}"
+                alt_path = os.path.join(target_dir, alt_name)
+
                 if os.path.exists(dest_path):
                     skipped += 1
-                    if f.get("is_primary"):
+                    if is_primary:
                         primary_filenames.add(dest_name)
                     continue
                 if os.path.exists(old_path):
                     os.rename(old_path, dest_path)
                     skipped += 1
-                    if f.get("is_primary"):
+                    if is_primary:
+                        primary_filenames.add(dest_name)
+                    continue
+                if os.path.exists(alt_path):
+                    os.rename(alt_path, dest_path)
+                    skipped += 1
+                    if is_primary:
                         primary_filenames.add(dest_name)
                     continue
 
@@ -398,7 +411,7 @@ def main():
                 with open(dest_path, "wb") as fh:
                     fh.write(data)
                 copied += 1
-                if f.get("is_primary"):
+                if is_primary:
                     primary_filenames.add(dest_name)
                 _logger.log(f"    [{category}/{section_name}] inv#{inv_id} file#{file_id} -> {dest_path}")
 
