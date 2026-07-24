@@ -1083,6 +1083,7 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
         "max_price": f"{current_max:.2f}",
         "min_price_recorded_at": current_min_date,
         "max_price_recorded_at": current_max_date,
+        "recorded_at": now_str,
     }
     try:
         api_post("inventory-price-history-archive", archive_data)

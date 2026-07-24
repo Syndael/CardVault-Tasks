@@ -232,6 +232,13 @@ def get_ig_client() -> Client | None:
 
     try:
         cl.login(ig_username, ig_password)
+        try:
+            cl.get_timeline_feed()
+        except LoginRequired:
+            _logger and _logger.log("[FAIL] Login fresco rechazado por IG. Posiblemente necesitas aceptar nuevos terminos.")
+            _logger and _logger.log("       Inicia sesion manualmente en instagram.com y acepta los terminos.")
+            _logger and _logger.log("       Luego elimina el archivo de sesion y vuelve a ejecutar.")
+            return None
         cl.dump_settings(session_file)
         _logger and _logger.log("[OK] Login en IG correcto, sesion guardada")
         _IG_CLIENT = cl
@@ -241,6 +248,10 @@ def get_ig_client() -> Client | None:
         return None
     except ChallengeRequired:
         _logger and _logger.log("[FAIL] IG requiere verificacion (challenge). Debes iniciar sesion manualmente.")
+        return None
+    except LoginRequired:
+        _logger and _logger.log("[FAIL] Login rechazado por IG. Posiblemente necesitas aceptar nuevos terminos.")
+        _logger and _logger.log("       Inicia sesion manualmente en instagram.com y acepta los terminos.")
         return None
     except Exception as e:
         _logger and _logger.log(f"[FAIL] Login en IG fallo: {e}")
@@ -286,6 +297,16 @@ def publish_instagram(cl, image_paths, caption):
         permalink = f"https://www.instagram.com/p/{code}/"
         _logger and _logger.log(f"  [OK] Publicado! PK: {pk}  Permalink: {permalink}")
         return code, pk, permalink, None
+    except LoginRequired as e:
+        _logger and _logger.log(f"  [WARN] IG LoginRequired during upload: {e}")
+        global _IG_CLIENT
+        _IG_CLIENT = None
+        if os.path.isfile(_SESSION_FILE):
+            try:
+                os.unlink(_SESSION_FILE)
+            except Exception:
+                pass
+        raise
     except Exception as e:
         return None, None, None, str(e)
 
