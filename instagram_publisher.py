@@ -695,6 +695,7 @@ def _notify_owner(inv, subject, message):
 
 
 def process_publication(pub):
+    global _IG_CLIENT
     pub_id = pub["id"]
     inv_id = pub["inventory_id"]
     caption = pub.get("caption") or ""
@@ -748,15 +749,6 @@ def process_publication(pub):
     if not dev_mode:
         api_patch(f"publications/{pub_id}", {"status": "processing"})
 
-    cl = None
-    if not dev_mode:
-        cl = get_ig_client()
-        if not cl:
-            error_msg = "Could not connect to Instagram"
-            _logger and _logger.log(f"  [FAIL] {error_msg}")
-            api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
-            return
-
     _logger and _logger.log(f"  Downloading {len(file_ids)} image(s)...")
     tmp_files = download_images_to_temp(file_ids)
 
@@ -774,15 +766,25 @@ def process_publication(pub):
     story_frame_path = None
     story_failed = False
 
-    try:
-        stories_enabled = get_setting("instagram.enable.stories")
-        if stories_enabled is None or stories_enabled.strip() not in ("0", "false", "no"):
-            first_image = tmp_files[0] if tmp_files else None
-            story_video_path, story_frame_path = _create_story_video(first_image, collection_name)
-            if not story_video_path:
-                error_msg = "No se pudo generar el video de story (verificar FFmpeg, musica y gif)"
-                _logger and _logger.log(f"  [FAIL] {error_msg}")
+    stories_enabled_str = get_setting("instagram.enable.stories")
+    if stories_enabled_str is None or stories_enabled_str.strip() not in ("0", "false", "no"):
+        first_image = tmp_files[0] if tmp_files else None
+        story_video_path, story_frame_path = _create_story_video(first_image, collection_name)
+        if not story_video_path:
+            error_msg = "No se pudo generar el video de story (verificar FFmpeg, musica y gif)"
+            _logger and _logger.log(f"  [FAIL] {error_msg}")
 
+    cl = None
+    if not dev_mode:
+        cl = get_ig_client()
+        if not cl:
+            error_msg = "Could not connect to Instagram"
+            _logger and _logger.log(f"  [FAIL] {error_msg}")
+            cleanup_temp_files(tmp_files)
+            api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
+            return
+
+    try:
         if dev_mode:
             dev_base = (get_setting("instagram.dev.output") or
                         os.path.join(_SCRIPT_DIR, "dev_output"))
@@ -804,7 +806,7 @@ def process_publication(pub):
             _logger and _logger.log(f"  [DEV] Archivos guardados en: {dev_dir}")
             ig_code = f"DEV_{pub_id}"
             permalink = dev_dir
-        elif story_video_path or stories_enabled is not None and stories_enabled.strip() in ("0", "false", "no"):
+        elif story_video_path or stories_enabled_str is not None and stories_enabled_str.strip() in ("0", "false", "no"):
             _logger and _logger.log(f"  Publishing to Instagram ({len(tmp_files)} photo(s))...")
             ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
 
@@ -815,8 +817,29 @@ def process_publication(pub):
                     cl.video_upload_to_story(story_video_path, thumbnail=story_frame_path, links=links)
                     _logger and _logger.log("  [OK] Story con video subida")
                 except Exception as e:
-                    _logger and _logger.log(f"  [WARN] Story upload fallo, publicacion ya esta en IG: {e}")
-                    story_failed = True
+                    err_str = str(e).lower()
+                    _logger and _logger.log(f"  [WARN] Story upload fallo: {e}")
+                    if "login_required" in err_str:
+                        _logger and _logger.log("  Reintentando login para story...")
+                        _IG_CLIENT = None
+                        if os.path.isfile(_SESSION_FILE):
+                            try:
+                                os.unlink(_SESSION_FILE)
+                            except Exception:
+                                pass
+                        cl2 = get_ig_client()
+                        if cl2:
+                            try:
+                                links2 = [StoryLink(webUri=permalink)] if permalink else []
+                                cl2.video_upload_to_story(story_video_path, thumbnail=story_frame_path, links=links2)
+                                _logger and _logger.log("  [OK] Story con video subida (tras re-login)")
+                            except Exception as e2:
+                                _logger and _logger.log(f"  [WARN] Story upload fallo tras re-login: {e2}")
+                                story_failed = True
+                        else:
+                            story_failed = True
+                    else:
+                        story_failed = True
             elif ig_code:
                 _logger and _logger.log("  [SKIP] Stories desactivadas via config")
             else:
@@ -825,7 +848,6 @@ def process_publication(pub):
             error_msg = error_msg or "Story generation failed"
     except LoginRequired:
         _logger and _logger.log("  Sesion IG expirada, limpiando y reintentando...")
-        global _IG_CLIENT
         _IG_CLIENT = None
         if os.path.isfile(_SESSION_FILE):
             os.unlink(_SESSION_FILE)
@@ -940,12 +962,6 @@ def main():
             sys.exit(1)
 
         _logger.log(f"IG User: {ig_username}")
-
-        cl = get_ig_client()
-        if not cl:
-            _logger.log("[FAIL] Could not login to Instagram")
-            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
-            sys.exit(1)
     else:
         dev_output = (settings_by_key.get("instagram.dev.output") or
                       get_setting("instagram.dev.output") or
@@ -970,6 +986,11 @@ def main():
     else:
         pending = api_get("publications/pending-publish") or []
         _logger.log(f"Found {len(pending)} pending publication(s)")
+
+        if not pending:
+            _logger.log("[DONE] No pending publications")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            return
 
         if args.dry_run:
             for p in pending:

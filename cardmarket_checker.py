@@ -40,7 +40,7 @@ _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 _logger: TaskLogger | None = None
 
 # --- VERSION --- actualizar manualmente al subir a git
-BUILD_VERSION = "v4-preview"
+BUILD_VERSION = "v4.1"
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 
@@ -176,14 +176,17 @@ def normalizar_precio(price_str):
     return s
 
 
+_PRICE_PATTERN = r'(\d+(?:[.,]\d{3})*[.,]\d{2})\s*€'
+
+
 def extract_price_from_html(html):
-    match = re.search(r'(?:Desde|From|A partir de)[^\d]*(\d+[.,]\d{2})\s*€', html, re.IGNORECASE)
+    match = re.search(r'(?:Desde|From|A partir de)[^\d]*' + _PRICE_PATTERN, html, re.IGNORECASE)
     if match:
         return _strip_thousands(match.group(1)) + " €"
     match = re.search(r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)["\']', html)
     if match:
         return _strip_thousands(match.group(1).strip()) + " €"
-    match = re.search(r'(\d+[.,]\d{2})\s*€', html)
+    match = re.search(_PRICE_PATTERN, html)
     if match:
         return _strip_thousands(match.group(1)) + " €"
     return None
@@ -239,12 +242,24 @@ async def scrape_price(tab, url):
     return None
 
 
+def _is_zero_price(price_str):
+    if not price_str:
+        return False
+    try:
+        val = float(price_str.replace("€", "").replace(" ", "").replace(",", ".").strip())
+        return val <= 0.0
+    except ValueError:
+        return False
+
+
 async def _extract_price_from_tab(tab, html):
     price = None
     if isinstance(tab, _PWBrowserWrapper):
         price = extract_price_from_html(html)
-        if price:
+        if price and not _is_zero_price(price):
             return normalizar_precio(price)
+        if price and _is_zero_price(price):
+            return None
         return None
 
     try:
@@ -255,8 +270,10 @@ async def _extract_price_from_tab(tab, html):
                 if txt in ("desde", "from", "a partir de"):
                     dd = await dt.query_selector("~ dd")
                     if dd:
-                        price = (await dd.text).strip()
-                        break
+                        raw = (await dd.text).strip()
+                        if not _is_zero_price(raw):
+                            price = raw
+                            break
             except Exception:
                 pass
     except Exception:
@@ -266,7 +283,9 @@ async def _extract_price_from_tab(tab, html):
         try:
             loc = await tab.select("div.price-container")
             if loc:
-                price = (await loc.text).strip()
+                raw = (await loc.text).strip()
+                if not _is_zero_price(raw):
+                    price = raw
         except Exception:
             pass
 
@@ -275,7 +294,7 @@ async def _extract_price_from_tab(tab, html):
             spans = await tab.select_all("span[class*='price']")
             for span in spans:
                 txt = (await span.text).strip()
-                if "€" in txt and re.search(r"\d", txt):
+                if "€" in txt and re.search(r"\d", txt) and not _is_zero_price(txt):
                     price = txt
                     break
         except Exception:
@@ -285,12 +304,16 @@ async def _extract_price_from_tab(tab, html):
         try:
             loc = await tab.select("[itemprop='price']")
             if loc:
-                price = (await loc.get_attribute("content")) or (await loc.text).strip()
+                raw = (await loc.get_attribute("content")) or (await loc.text).strip()
+                if not _is_zero_price(raw):
+                    price = raw
         except Exception:
             pass
 
     if not price:
         price = extract_price_from_html(html)
+        if price and _is_zero_price(price):
+            price = None
 
     if price:
         price = normalizar_precio(price)
@@ -480,7 +503,7 @@ async def _connectivity_check(browser, tab):
                 _logger.log(f"  [OK] Navegador: conectado ({len(html)} bytes)")
                 return True
             if _detect_cloudflare(html):
-                _logger.log(f"  [FAIL] Cloudflare persiste tras 20s")
+                _logger.log(f"  [FAIL] Cloudflare persiste tras 33s")
                 return False
             _logger.log(f"  [WARN] Pagina inusual ({len(html)} bytes)")
         except Exception as e:
@@ -888,12 +911,11 @@ async def _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
                     price_str = await _scrape_price_cffi(full_url)
 
                 if price_str and price_str != "NO_ENCONTRADO":
-                    scraped_count += 1
                     try:
                         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
                     except ValueError:
                         _logger.log(f"  Precio mal formado: '{price_str}', intentando extraer del HTML...")
-                        if tab is not None:
+                        if tab is not None and not isinstance(tab, _PWBrowserWrapper):
                             html = await tab.get_content()
                             fallback = extract_price_from_html(html)
                             if fallback:
@@ -908,6 +930,12 @@ async def _process_wishlist(product_tracking, wishlist_minutes, price_minutes,
                             error_count += 1
                             continue
 
+                    if new_price <= 0:
+                        _logger.log(f"  Precio 0€ ignorado")
+                        error_count += 1
+                        continue
+
+                    scraped_count += 1
                     _logger.log(f"  Precio encontrado: {price_str}")
 
                     wl_data = {
@@ -1005,7 +1033,7 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
     try:
         new_price = float(price_str.replace(" €", "").replace(",", ".").strip())
     except ValueError:
-        if tab is not None:
+        if tab is not None and not isinstance(tab, _PWBrowserWrapper):
             html = await tab.get_content()
             fallback = extract_price_from_html(html)
             if fallback:
@@ -1015,6 +1043,10 @@ async def _save_inventory_price(inv_id, tracking_id, price_str, tab):
                 return None
         else:
             return None
+
+    if new_price <= 0:
+        _logger.log(f"  Precio 0€ ignorado")
+        return None
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
