@@ -40,7 +40,7 @@ _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
 _logger: TaskLogger | None = None
 
 # --- VERSION --- actualizar manualmente al subir a git
-BUILD_VERSION = "v4.1"
+BUILD_VERSION = "v4.2"
 
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "").lower() in ("1", "true", "yes")
 

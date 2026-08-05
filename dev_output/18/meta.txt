@@ -1,0 +1,5 @@
+Publication ID: 18
+Product: 10
+Collection: Edición Básica
+Inventories: [14]
+Total files: 3
