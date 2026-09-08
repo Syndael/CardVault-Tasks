@@ -3,19 +3,21 @@
 Production Instagram Publisher for CardVault.
 
 Fetches pending publications from the CardVault API and publishes them
-to Instagram via instagrapi (private API). Sube imagenes directamente,
-sin necesidad de URLs HTTPS publicas.
+to Instagram via Instagram Graph API (official). Uses Cloudflare R2 for
+temporary image storage to get public URLs.
 
 Steps per publication:
-  1. Load inventory item and its files (ordered, instagram_sort_order)
-  2. Build caption from product/inventory info
-  3. Download images to temp files
-  4. Upload photo(s) via instagrapi:
-     - Single photo -> photo_upload
-     - Multiple photos -> album_upload
-  5. Share first photo to stories (with video + music if FFmpeg available)
-  6. Update publication status, save Instagram media ID/permalink
-  7. Mark inventory as posted_instagram = True
+   1. Load inventory item and its files (ordered, from publication_detail_file)
+   2. Build caption from product/inventory info
+   3. Download images to temp files
+   4. Upload images to R2 (temporary public URLs)
+   5. Publish via Instagram Graph API:
+      - Single photo -> publish_photo
+      - Multiple photos -> publish_album
+   6. Share first photo to stories (with video + music via Graph API)
+   7. Delete temp files from R2
+   8. Update publication status, save Instagram media ID/permalink
+   9. Mark inventory as posted_instagram = True
 
 Usage:
   python instagram_publisher.py                        # publish all pending
@@ -26,16 +28,25 @@ Environment (tasks .env):
   CARDVAULT_API_BASE, CARDVAULT_API_USERNAME, CARDVAULT_API_PASSWORD
 
 Settings (via CardVault API):
-  instagram.username        → Instagram username
-  instagram.password        → Instagram password
-  instagram.music.dir       → (optional) music directory for story videos
-  instagram.enable.stories  → (optional, default "1") "0" to disable stories
+  task.publisher.instagram.access.token    → Instagram Graph API long-lived token
+  task.publisher.instagram.user.id         → Instagram Business Account ID
+  task.publisher.instagram.app.id          → Facebook App ID
+  task.publisher.instagram.app.secret      → Facebook App Secret
+  r2.endpoint               → Cloudflare R2 endpoint
+  r2.bucket                 → R2 bucket name
+  task.publisher.r2.access.key             → R2 access key
+  task.publisher.r2.secret.key             → R2 secret key
+  task.publisher.r2.public.url             → R2 public URL
+  task.publisher.instagram.music.dir       → (optional) music directory for story videos
+  task.publisher.instagram.enable.stories  → (optional, default "1") "0" to disable stories
+  task.publisher.instagram.gif.dir         → (optional) gif directory for overlays
 """
 
 import argparse
 import json
 import os
 import random
+import re
 import shutil
 import smtplib
 import subprocess
@@ -48,17 +59,17 @@ import urllib.request
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 
+import boto3
+import requests
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, BadPassword, ChallengeRequired
-from instagrapi.types import StoryLink
 from PIL import Image, ImageDraw, ImageFilter
 
 from task_logger import TaskLogger, finalize_log
 
 load_dotenv()
 
-BUILD_VERSION = "v4.2"
+BUILD_VERSION = "v5.1-graph-api"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -98,9 +109,6 @@ _TCG_FOLDER_MAP = {
 }
 
 _DEV_MODE: bool = os.getenv("IG_DEV_MODE", "").lower() in ("1", "true", "yes")
-
-_IG_CLIENT: Client | None = None
-_SESSION_FILE: str = os.path.join(_SCRIPT_DIR, "ig_session.json")
 
 
 def _login() -> bool:
@@ -197,70 +205,6 @@ def update_setting(key, value):
     return api_patch(f"settings/by-key/{key}", {"setting_value": value}) is not None
 
 
-def get_ig_client() -> Client | None:
-    global _IG_CLIENT
-
-    if _IG_CLIENT is not None:
-        return _IG_CLIENT
-
-    ig_username = get_setting("instagram.username")
-    ig_password = get_setting("instagram.password")
-
-    if not ig_username or not ig_password:
-        _logger and _logger.log("[FAIL] No Instagram credentials. Set 'instagram.username' and 'instagram.password'")
-        return None
-
-    session_file = _SESSION_FILE
-    if os.path.isdir(session_file):
-        session_file = os.path.join(session_file, "ig_session.json")
-
-    cl = Client()
-    cl.delay_range = [2, 5]
-
-    if os.path.isfile(session_file):
-        try:
-            cl.load_settings(session_file)
-            cl.login(ig_username, ig_password)
-            cl.get_timeline_feed()
-            cl.dump_settings(session_file)
-            _logger and _logger.log("[OK] IG session restaurada desde archivo")
-            _IG_CLIENT = cl
-            return cl
-        except (LoginRequired, Exception) as e:
-            _logger and _logger.log(f"[WARN] No se pudo restaurar sesion IG: {e}, haciendo login fresco...")
-            try:
-                os.unlink(session_file)
-            except Exception:
-                pass
-
-    try:
-        cl.login(ig_username, ig_password)
-        try:
-            cl.get_timeline_feed()
-        except LoginRequired:
-            _logger and _logger.log("[FAIL] Login fresco rechazado por IG. Posiblemente necesitas aceptar nuevos terminos.")
-            _logger and _logger.log("       Inicia sesion manualmente en instagram.com y acepta los terminos.")
-            _logger and _logger.log("       Luego elimina el archivo de sesion y vuelve a ejecutar.")
-            return None
-        cl.dump_settings(session_file)
-        _logger and _logger.log("[OK] Login en IG correcto, sesion guardada")
-        _IG_CLIENT = cl
-        return cl
-    except BadPassword:
-        _logger and _logger.log("[FAIL] IG password incorrecto")
-        return None
-    except ChallengeRequired:
-        _logger and _logger.log("[FAIL] IG requiere verificacion (challenge). Debes iniciar sesion manualmente.")
-        return None
-    except LoginRequired:
-        _logger and _logger.log("[FAIL] Login rechazado por IG. Posiblemente necesitas aceptar nuevos terminos.")
-        _logger and _logger.log("       Inicia sesion manualmente en instagram.com y acepta los terminos.")
-        return None
-    except Exception as e:
-        _logger and _logger.log(f"[FAIL] Login en IG fallo: {e}")
-        return None
-
-
 def download_images_to_temp(file_ids):
     tmp_files = []
     for fid in file_ids:
@@ -301,38 +245,446 @@ def cleanup_temp_files(tmp_files):
             pass
 
 
-def publish_instagram(cl, image_paths, caption):
-    try:
-        if len(image_paths) == 1:
-            path = image_paths[0]
-            if path.lower().endswith((".mp4", ".mov", ".webm")):
-                media = cl.video_upload(path, caption=caption)
-            else:
-                media = cl.photo_upload(path, caption=caption)
-        else:
-            media = cl.album_upload(image_paths[:10], caption=caption)
+class R2Storage:
+    def __init__(self, endpoint, bucket_name, access_key, secret_key, public_url):
+        self.endpoint = endpoint
+        self.bucket_name = bucket_name
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.public_url = public_url.rstrip("/")
 
-        pk = str(media.pk)
-        code = media.code if hasattr(media, 'code') and media.code else pk
-        permalink = f"https://www.instagram.com/p/{code}/"
-        _logger and _logger.log(f"  [OK] Publicado! PK: {pk}  Permalink: {permalink}")
-        return code, pk, permalink, None
-    except LoginRequired as e:
-        _logger and _logger.log(f"  [WARN] IG LoginRequired during upload: {e}")
-        global _IG_CLIENT
-        _IG_CLIENT = None
-        if os.path.isfile(_SESSION_FILE):
+        self.client = boto3.client(
+            "s3",
+            endpoint_url=self.endpoint,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key,
+            region_name="auto",
+        )
+
+    def upload_image(self, local_path, content_type="image/jpeg"):
+        filename = os.path.basename(local_path)
+        key = f"ig-temp/{int(time.time())}_{filename}"
+        try:
+            with open(local_path, "rb") as f:
+                self.client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=key,
+                    Body=f.read(),
+                    ContentType=content_type,
+                )
+            public_url = f"{self.public_url}/{key}"
+            _logger and _logger.log(f"  Imagen subida a R2: {key}")
+            return public_url, key
+        except Exception as e:
+            _logger and _logger.log(f"  [ERROR] Subiendo a R2: {e}")
+            return None, None
+
+    def delete_object(self, key):
+        try:
+            self.client.delete_object(Bucket=self.bucket_name, Key=key)
+            _logger and _logger.log(f"  Objeto eliminado de R2: {key}")
+            return True
+        except ClientError as e:
+            _logger and _logger.log(f"  [WARN] Error eliminando de R2: {e}")
+            return False
+
+
+class InstagramGraphAPI:
+    GRAPH_URL = "https://graph.facebook.com/v21.0"
+
+    def __init__(self, access_token, ig_user_id):
+        self.access_token = access_token
+        self.ig_user_id = ig_user_id
+        self.max_retries = 3
+        self._token_valid = None
+
+    def verify_token(self):
+        if self._token_valid is not None:
+            return self._token_valid
+        try:
+            result = self._make_request("me", params={"fields": "id,name"}, method="GET")
+            self._token_valid = True
+            _logger and _logger.log(f"  Token IG valido para: {result.get('name', '?')}")
+            return True
+        except Exception as e:
+            self._token_valid = False
+            error_msg = str(e)
+            if "OAuthException" in error_msg or "Invalid OAuth" in error_msg:
+                _logger and _logger.log(f"  [ERROR] Token IG expirado o invalido: {error_msg}")
+            else:
+                _logger and _logger.log(f"  [ERROR] Error verificando token IG: {error_msg}")
+            return False
+
+    def _make_request(self, endpoint, params=None, method="POST"):
+        url = f"{self.GRAPH_URL}/{endpoint}"
+        if params is None:
+            params = {}
+        params["access_token"] = self.access_token
+
+        for attempt in range(self.max_retries):
             try:
-                os.unlink(_SESSION_FILE)
-            except Exception:
-                pass
-        raise
+                if method == "POST":
+                    r = requests.post(url, data=params, timeout=60)
+                else:
+                    r = requests.get(url, params=params, timeout=60)
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.RequestException as e:
+                _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2)
+                else:
+                    raise
+        return None
+
+    def _wait_for_container(self, container_id, timeout=120):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                result = self._make_request(
+                    container_id,
+                    params={"fields": "status_code,status"},
+                    method="GET",
+                )
+                status = result.get("status_code", "")
+                if status == "FINISHED":
+                    return True
+                elif status == "ERROR":
+                    _logger and _logger.log(f"  Container error: {result.get('status', 'unknown')}")
+                    return False
+                time.sleep(2)
+            except Exception as e:
+                _logger and _logger.log(f"  [WARN] Error verificando container: {e}")
+                time.sleep(2)
+        _logger and _logger.log(f"  [ERROR] Timeout esperando container {container_id}")
+        return False
+
+    def _get_media_shortcode(self, media_id):
+        try:
+            result = self._make_request(
+                media_id,
+                params={"fields": "shortcode,permalink"},
+                method="GET",
+            )
+            shortcode = result.get("shortcode", "")
+            if not shortcode:
+                permalink = result.get("permalink", "")
+                if permalink:
+                    match = re.search(r"/p/([^/]+)/", permalink)
+                    if match:
+                        shortcode = match.group(1)
+            return shortcode
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] Error obteniendo shortcode: {e}")
+            return ""
+
+    def publish_photo(self, image_url, caption=""):
+        try:
+            container = self._make_request(
+                f"{self.ig_user_id}/media",
+                params={
+                    "image_url": image_url,
+                    "caption": caption,
+                    "media_type": "IMAGE",
+                },
+            )
+            container_id = container.get("id")
+            if not container_id:
+                return None, None, "No se recibio container_id"
+
+            if not self._wait_for_container(container_id):
+                return None, None, "Container no finalizo"
+
+            result = self._make_request(
+                f"{self.ig_user_id}/media_publish",
+                params={"creation_id": container_id},
+            )
+            media_id = result.get("id")
+            shortcode = result.get("shortcode", "")
+            if not shortcode and media_id:
+                shortcode = self._get_media_shortcode(media_id)
+
+            _logger and _logger.log(f"  Foto publicada: media_id={media_id}, shortcode={shortcode}")
+            return shortcode, media_id, None
+        except Exception as e:
+            return None, None, str(e)
+
+    def publish_album(self, image_urls, caption=""):
+        try:
+            if len(image_urls) < 2:
+                return self.publish_photo(image_urls[0], caption)
+
+            children_ids = []
+            for image_url in image_urls[:10]:
+                container = self._make_request(
+                    f"{self.ig_user_id}/media",
+                    params={
+                        "image_url": image_url,
+                        "is_carousel_item": "true",
+                    },
+                )
+                child_id = container.get("id")
+                if child_id:
+                    children_ids.append(child_id)
+
+            if not children_ids:
+                return None, None, "No se pudieron crear containers hijos"
+
+            for child_id in children_ids:
+                if not self._wait_for_container(child_id):
+                    return None, None, f"Container hijo {child_id} no finalizo"
+
+            parent_container = self._make_request(
+                f"{self.ig_user_id}/media",
+                params={
+                    "media_type": "CAROUSEL",
+                    "children": ",".join(children_ids),
+                    "caption": caption,
+                },
+            )
+            parent_id = parent_container.get("id")
+            if not parent_id:
+                return None, None, "No se recibio parent_id"
+
+            if not self._wait_for_container(parent_id):
+                return None, None, "Container padre no finalizo"
+
+            result = self._make_request(
+                f"{self.ig_user_id}/media_publish",
+                params={"creation_id": parent_id},
+            )
+            media_id = result.get("id")
+            shortcode = result.get("shortcode", "")
+            if not shortcode and media_id:
+                shortcode = self._get_media_shortcode(media_id)
+
+            _logger and _logger.log(f"  Album publicado: media_id={media_id}, shortcode={shortcode}")
+            return shortcode, media_id, None
+        except Exception as e:
+            return None, None, str(e)
+
+    def publish_story(self, image_url=None, video_url=None):
+        try:
+            params = {"media_type": "STORIES"}
+            if video_url:
+                params["video_url"] = video_url
+                if image_url:
+                    params["thumb_offset"] = 0
+            elif image_url:
+                params["image_url"] = image_url
+            else:
+                return None, None, "Se requiere image_url o video_url"
+
+            container = self._make_request(
+                f"{self.ig_user_id}/media",
+                params=params,
+            )
+            container_id = container.get("id")
+            if not container_id:
+                return None, None, "No se recibio container_id para story"
+
+            if not self._wait_for_container(container_id, timeout=180):
+                return None, None, "Container de story no finalizo"
+
+            result = self._make_request(
+                f"{self.ig_user_id}/media_publish",
+                params={"creation_id": container_id},
+            )
+            media_id = result.get("id")
+            shortcode = result.get("shortcode", "")
+            if not shortcode and media_id:
+                shortcode = self._get_media_shortcode(media_id)
+
+            _logger and _logger.log(f"  Story publicada: media_id={media_id}, shortcode={shortcode}")
+            return shortcode, media_id, None
+        except Exception as e:
+            return None, None, str(e)
+
+
+def refresh_ig_token(access_token, app_id, app_secret):
+    try:
+        url = "https://graph.instagram.com/refresh_access_token"
+        params = {
+            "grant_type": "ig_refresh_token",
+            "access_token": access_token,
+        }
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        new_token = data.get("access_token")
+        expires_in = data.get("expires_in", 5184000)
+        if new_token:
+            _logger and _logger.log(f"  Token refrescado correctamente (valido {expires_in // 86400} dias)")
+            return new_token, expires_in
+        else:
+            _logger and _logger.log(f"  [ERROR] No se recibio nuevo token: {data}")
+            return None, None
+    except requests.exceptions.RequestException as e:
+        _logger and _logger.log(f"  [ERROR] Error refrescando token: {e}")
+        return None, None
+
+
+def try_refresh_token(cfg_data):
+    _logger and _logger.log("Verificando token de Instagram...")
+    ig = InstagramGraphAPI(cfg_data["access_token"], cfg_data["user_id"])
+
+    if ig.verify_token():
+        _logger and _logger.log("  Token valido, no es necesario refrescar")
+        return True
+
+    _logger and _logger.log("  [WARN] Token invalido o expirado, intentando refrescar...")
+    new_token, expires_in = refresh_ig_token(
+        cfg_data["access_token"], cfg_data["app_id"], cfg_data["app_secret"]
+    )
+
+    if new_token:
+        if update_setting("task.publisher.instagram.access.token", new_token):
+            _logger and _logger.log("  Token refrescado y guardado")
+            cfg_data["access_token"] = new_token
+            return True
+        else:
+            _logger and _logger.log("  [ERROR] Token refrescado pero no se pudo guardar")
+            return False
+    else:
+        _logger and _logger.log("  [ERROR] No se pudo refrescar el token")
+        return False
+
+
+def get_ig_config():
+    return {
+        "access_token": get_setting("task.publisher.instagram.access.token") or "",
+        "user_id": get_setting("task.publisher.instagram.user.id") or "",
+        "app_id": get_setting("task.publisher.instagram.app.id") or "",
+        "app_secret": get_setting("task.publisher.instagram.app.secret") or "",
+    }
+
+
+def get_r2_config():
+    return {
+        "endpoint": get_setting("task.publisher.r2.endpoint") or "",
+        "bucket": get_setting("task.publisher.r2.bucket") or "",
+        "access_key": get_setting("task.publisher.r2.access.key") or "",
+        "secret_key": get_setting("task.publisher.r2.secret.key") or "",
+        "public_url": get_setting("task.publisher.r2.public.url") or "",
+    }
+
+
+def create_r2_client():
+    cfg = get_r2_config()
+    if not all([cfg["endpoint"], cfg["bucket"], cfg["access_key"], cfg["secret_key"], cfg["public_url"]]):
+        _logger and _logger.log("[FAIL] R2 config incompleta. Configure r2.endpoint, r2.bucket, r2.access_key, r2.secret_key, r2.public_url")
+        return None
+    try:
+        r2 = R2Storage(cfg["endpoint"], cfg["bucket"], cfg["access_key"], cfg["secret_key"], cfg["public_url"])
+        return r2
+    except Exception as e:
+        _logger and _logger.log(f"[FAIL] Error inicializando R2: {e}")
+        return None
+
+
+def publish_instagram(r2, image_paths, caption):
+    ig_cfg = get_ig_config()
+    if not all([ig_cfg["access_token"], ig_cfg["user_id"]]):
+        return None, None, None, "Credenciales IG incompletas. Configure instagram.access_token e instagram.user_id"
+
+    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"])
+    if not ig.verify_token():
+        return None, None, None, "Token de Instagram expirado o invalido. Regenera el token en Facebook Developers."
+
+    image_urls = []
+    r2_keys = []
+
+    try:
+        for image_path in image_paths:
+            url, key = r2.upload_image(image_path)
+            if url:
+                image_urls.append(url)
+                r2_keys.append(key)
+            else:
+                for k in r2_keys:
+                    r2.delete_object(k)
+                return None, None, None, "Error subiendo imagenes a R2"
+
+        if len(image_urls) == 1:
+            code, media_id, error = ig.publish_photo(image_urls[0], caption)
+        else:
+            code, media_id, error = ig.publish_album(image_urls, caption)
+
+        if code:
+            permalink = f"https://www.instagram.com/p/{code}/"
+            _logger and _logger.log(f"  [OK] Publicado! Permalink: {permalink}")
+            return code, media_id, permalink, None
+        else:
+            return None, None, None, error
     except Exception as e:
         return None, None, None, str(e)
+    finally:
+        for key in r2_keys:
+            r2.delete_object(key)
+
+
+def share_to_story(r2, image_path, collection_name, video_path=None, frame_path=None):
+    ig_cfg = get_ig_config()
+    if not all([ig_cfg["access_token"], ig_cfg["user_id"]]):
+        _logger and _logger.log("  [ERROR] Credenciales IG incompletas para story")
+        if video_path:
+            return False, video_path
+        return False, None
+
+    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"])
+    if not ig.verify_token():
+        _logger and _logger.log("  [ERROR] Token IG expirado, no se puede publicar story")
+        if video_path:
+            return False, video_path
+        return False, None
+
+    own_video = video_path is None
+    if own_video:
+        video_path, frame_path = _create_story_video(image_path, collection_name)
+    if not video_path:
+        _logger and _logger.log("  No se genero el video de story, se omite.")
+        if frame_path and own_video:
+            try:
+                os.unlink(frame_path)
+            except Exception:
+                pass
+        return False, None
+
+    video_url, video_key = r2.upload_image(video_path, content_type="video/mp4")
+    if not video_url:
+        _logger and _logger.log("  [ERROR] Error subiendo video de story a R2")
+        if own_video:
+            os.unlink(video_path)
+            if frame_path:
+                os.unlink(frame_path)
+        return False, video_path
+
+    try:
+        _logger and _logger.log("  Publicando story via Graph API...")
+        code, media_id, error = ig.publish_story(video_url=video_url)
+
+        if code:
+            _logger and _logger.log(f"  [OK] Story publicada. shortcode={code}")
+            if own_video:
+                os.unlink(video_path)
+                if frame_path:
+                    os.unlink(frame_path)
+            return True, None
+        else:
+            _logger and _logger.log(f"  [ERROR] Error publicando story: {error}")
+            if own_video and frame_path:
+                try:
+                    os.unlink(frame_path)
+                except Exception:
+                    pass
+            return False, video_path
+    finally:
+        if video_key:
+            r2.delete_object(video_key)
 
 
 def _pick_music(collection_name):
-    music_dir = get_setting("instagram.music.dir")
+    music_dir = get_setting("task.publisher.instagram.music.dir")
     if not music_dir:
         return None
     if music_dir.startswith("./"):
@@ -384,7 +736,7 @@ def _tcg_folder(collection_name):
 
 
 def _pick_overlay(collection_name):
-    gif_dir = get_setting("instagram.gif.dir") or os.path.join(_SCRIPT_DIR, "gif")
+    gif_dir = get_setting("task.publisher.instagram.gif.dir") or os.path.join(_SCRIPT_DIR, "gif")
     if gif_dir.startswith("./"):
         gif_dir = os.path.join(_SCRIPT_DIR, gif_dir[2:])
     if not os.path.isdir(gif_dir):
@@ -500,57 +852,6 @@ def _compute_overlay_pos(overlay_path):
     return ox, oy, ow, oh
 
 
-def _pick_flechas():
-    gif_dir = get_setting("instagram.gif.dir") or os.path.join(_SCRIPT_DIR, "gif")
-    if gif_dir.startswith("./"):
-        gif_dir = os.path.join(_SCRIPT_DIR, gif_dir[2:])
-    flechas_dir = os.path.join(gif_dir, "flechas")
-    if not os.path.isdir(flechas_dir):
-        return None
-
-    img_exts = (".gif", ".png", ".jpg", ".jpeg", ".webp")
-    candidates = [os.path.join(flechas_dir, f) for f in os.listdir(flechas_dir)
-                  if f.lower().endswith(img_exts)]
-    if not candidates:
-        return None
-
-    random.shuffle(candidates)
-    for chosen in candidates:
-        if chosen.lower().endswith(".gif"):
-            try:
-                result = subprocess.run(
-                    ["ffmpeg", "-v", "error", "-stream_loop", "-1", "-i", chosen, "-t", "1", "-f", "null", "-"],
-                    capture_output=True, text=True, timeout=8)
-                if result.returncode != 0:
-                    continue
-            except Exception:
-                continue
-        _logger and _logger.log(f"  Flecha seleccionada: {os.path.basename(chosen)}")
-        return chosen
-
-    return None
-
-
-def _compute_flechas_pos(overlay_path):
-    W, H = 540, 960
-    try:
-        ovl = Image.open(overlay_path)
-        w, h = ovl.size
-    except Exception:
-        return None, None, None, None
-
-    target_ratio = random.uniform(0.03, 0.05)
-    ov_area = W * H * target_ratio
-    aspect = w / h if h > 0 else 1.0
-    ow = int((ov_area * aspect) ** 0.5)
-    oh = max(int(ow / aspect), 1)
-
-    ox = int(W * 0.50 + W * 0.03)
-    oy = int(H * 0.50 + H * 0.07)
-
-    return ox, oy, ow, oh
-
-
 def _create_story_video(image_path, collection_name, output_path=None, heavy_blur=False):
     if not shutil.which("ffmpeg"):
         _logger and _logger.log("  FFmpeg no encontrado")
@@ -558,7 +859,6 @@ def _create_story_video(image_path, collection_name, output_path=None, heavy_blu
 
     music_path = _pick_music(collection_name)
     overlay_path = _pick_overlay(collection_name)
-    flecha_path = _pick_flechas()
     if not music_path:
         _logger and _logger.log("  Generando story sin musica (video silencioso)")
 
@@ -598,28 +898,12 @@ def _create_story_video(image_path, collection_name, output_path=None, heavy_blu
                 )
                 last_out = "[out0]"
 
-        if flecha_path:
-            fox, foy, fow, foh = _compute_flechas_pos(flecha_path)
-            if fox is None:
-                _logger and _logger.log("  Flecha no valida, omitiendo")
-            else:
-                _logger and _logger.log(f"  Flecha pos=({fox},{foy}) size=({fow},{foh})")
-                flecha_ext = os.path.splitext(flecha_path)[1].lower()
-                loop_opt = "-stream_loop" if flecha_ext == ".gif" else "-loop"
-                cmd += [loop_opt, "-1" if flecha_ext == ".gif" else "1", "-i", flecha_path]
-                inputs += 1
-                filter_parts.append(
-                    f"[{inputs - 1}:v]scale={fow}:{foh},setsar=1[fl];"
-                    f"{last_out}[fl]overlay={fox}:{foy}[outf]"
-                )
-                last_out = "[outf]"
-
         if music_path:
             cmd += ["-i", music_path]
 
         if filter_parts:
             vf = ";".join(filter_parts)
-            if last_out == "[out0]" or last_out == "[outf]":
+            if last_out == "[out0]":
                 vf += f";{last_out}scale=1080:1920:flags=lanczos[outv]"
                 last_out = "[outv]"
             else:
@@ -834,14 +1118,15 @@ def _notify_owner(inv, subject, message):
             send_telegram_notification(message, owner["telegram_id"])
 
 
-def process_publication(pub):
-    global _IG_CLIENT
-    pub_id = pub["id"]
-    caption = pub.get("caption") or ""
-    existing_status = pub.get("status", "pending_publish")
+def process_detail(detail, r2):
+    detail_id = detail["id"]
+    pub_id = detail["publication_id"]
+    pub = detail.get("publication") or api_get(f"publications/{pub_id}") or {}
+    caption = detail.get("resolved_caption") or detail.get("caption") or pub.get("caption") or ""
+    existing_status = detail.get("status", "pending_publish")
 
     if existing_status in ("published", "cancelled"):
-        _logger and _logger.log(f"  [SKIP] Publication #{pub_id} already {existing_status}")
+        _logger and _logger.log(f"  [SKIP] Detail #{detail_id} already {existing_status}")
         return
 
     inventories = pub.get("inventories") or []
@@ -849,9 +1134,9 @@ def process_publication(pub):
 
     _logger and _logger.log(f"\n{'=' * 58}")
     if inv_ids:
-        _logger and _logger.log(f"Processing publication #{pub_id} (inventories: {inv_ids})")
+        _logger and _logger.log(f"Processing detail #{detail_id} (pub #{pub_id}, inventories: {inv_ids})")
     else:
-        _logger and _logger.log(f"Processing publication #{pub_id} (manual, no inventory)")
+        _logger and _logger.log(f"Processing detail #{detail_id} (pub #{pub_id}, manual, no inventory)")
     _logger and _logger.log(f"{'=' * 58}")
 
     product_name = "Manual publication"
@@ -871,11 +1156,9 @@ def process_publication(pub):
             product_name = product.get("name") or product.get("product_number", f"Product #{product.get('id', '?')}")
             collection_name = collection.get("name") or collection.get("code", "")
 
-    # Collect all files via publication endpoint (includes both inventory-linked and direct files)
     pub_detail = api_get(f"files/by-publication/{pub_id}") or []
-    ig_files = [f for f in pub_detail if f.get("instagram_sort_order") is not None]
-    ig_files.sort(key=lambda f: f["instagram_sort_order"])
-    all_file_ids = [f["id"] for f in ig_files if f.get("id")]
+    detail_files = detail.get("files") or []
+    all_file_ids = [f["file_id"] for f in detail_files if f.get("file_id")]
 
     if not caption:
         if inv_for_meta:
@@ -896,14 +1179,14 @@ def process_publication(pub):
     if not all_file_ids:
         error_msg = "No images for this publication"
         _logger and _logger.log(f"  [FAIL] {error_msg}")
-        api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
+        api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
         return
 
     dev_mode = (_DEV_MODE or
-                (get_setting("instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
+                (get_setting("task.publisher.instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
 
     if not dev_mode:
-        api_patch(f"publications/{pub_id}", {"status": "processing"})
+        api_patch(f"publication-details/{detail_id}", {"status": "processing"})
 
     _logger and _logger.log(f"  Downloading {len(all_file_ids)} file(s)...")
     tmp_files = download_images_to_temp(all_file_ids)
@@ -922,7 +1205,7 @@ def process_publication(pub):
     story_frame_path = None
     story_failed = False
 
-    stories_enabled_str = get_setting("instagram.enable.stories")
+    stories_enabled_str = get_setting("task.publisher.instagram.enable.stories")
     if stories_enabled_str is None or stories_enabled_str.strip() not in ("0", "false", "no"):
         first_is_video = tmp_files and tmp_files[0].lower().endswith(('.mp4', '.mov', '.webm'))
         first_image = next((f for f in tmp_files if not f.lower().endswith(('.mp4', '.mov', '.webm'))), tmp_files[0] if tmp_files else None)
@@ -930,16 +1213,6 @@ def process_publication(pub):
         if not story_video_path:
             error_msg = "No se pudo generar el video de story (verificar FFmpeg, musica y gif)"
             _logger and _logger.log(f"  [FAIL] {error_msg}")
-
-    cl = None
-    if not dev_mode:
-        cl = get_ig_client()
-        if not cl:
-            error_msg = "Could not connect to Instagram"
-            _logger and _logger.log(f"  [FAIL] {error_msg}")
-            cleanup_temp_files(tmp_files)
-            api_patch(f"publications/{pub_id}", {"status": "failed", "error_message": error_msg})
-            return
 
     try:
         if dev_mode:
@@ -972,54 +1245,43 @@ def process_publication(pub):
             ig_code = f"DEV_{pub_id}"
             permalink = dev_dir
 
-        # Production: always publish the main post (story failure doesn't block it)
         if not dev_mode:
             _logger and _logger.log(f"  Publishing to Instagram ({len(tmp_files)} file(s))...")
-            ig_code, media_pk, permalink, error = publish_instagram(cl, tmp_files, caption)
+            ig_code, media_pk, permalink, error = publish_instagram(r2, tmp_files, caption)
 
             if ig_code and story_video_path:
-                story_uploaded = False
-                for story_attempt in range(3):
-                    try:
-                        if 0 < story_attempt < 2:
-                            _logger and _logger.log(f"  Reintentando story (intento {story_attempt + 1}/3)...")
-                            time.sleep(random.uniform(8, 15))
-                            _IG_CLIENT = None
-                            if os.path.isfile(_SESSION_FILE):
-                                try:
-                                    os.unlink(_SESSION_FILE)
-                                except Exception:
-                                    pass
-                            cl = get_ig_client()
-                            if not cl:
-                                story_failed = True
-                                break
-                            time.sleep(random.uniform(3, 6))
-                        else:
-                            time.sleep(random.uniform(5, 10))
-                        links = [StoryLink(webUri=permalink, x=0.5, y=0.55, width=0.85, height=0.85)] if permalink else []
-                        _logger and _logger.log(f"  Subiendo story con video (intento {story_attempt + 1})...")
-                        cl.video_upload_to_story(story_video_path, thumbnail=story_frame_path, links=links)
-                        _logger and _logger.log("  [OK] Story con video subida")
-                        story_uploaded = True
-                        break
-                    except Exception as e:
-                        err_str = str(e).lower()
-                        _logger and _logger.log(f"  [WARN] Story upload fallo (intento {story_attempt + 1}): {e}")
-                        if "login_required" not in err_str and story_attempt >= 2:
-                            story_failed = True
-                            break
+                story_uploaded, story_video_fallback = share_to_story(
+                    r2, tmp_files[0], collection_name,
+                    video_path=story_video_path, frame_path=story_frame_path,
+                )
                 if not story_uploaded:
                     story_failed = True
+                    if story_video_fallback and inv_for_meta:
+                        owner_id = inv_for_meta.get("user_id")
+                        if owner_id:
+                            token = _get_token()
+                            if token:
+                                try:
+                                    url = f"{API_BASE.rstrip('/')}/auth/user/{owner_id}"
+                                    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                                    with urllib.request.urlopen(req, timeout=10) as resp:
+                                        owner = json.loads(resp.read().decode("utf-8"))
+                                    if owner and owner.get("telegram_id"):
+                                        send_telegram_video(owner["telegram_id"], story_video_fallback,
+                                                            f"Story fallida para #{pub_id}: {product_name}")
+                                except Exception:
+                                    pass
+                    if story_video_fallback:
+                        try:
+                            os.unlink(story_video_fallback)
+                        except Exception:
+                            pass
+                else:
+                    story_video_path = None
+                    story_frame_path = None
             elif not ig_code and error:
                 if not error_msg:
                     error_msg = error
-    except LoginRequired:
-        _logger and _logger.log("  Sesion IG expirada, limpiando y reintentando...")
-        _IG_CLIENT = None
-        if os.path.isfile(_SESSION_FILE):
-            os.unlink(_SESSION_FILE)
-        error_msg = "Instagram session expired, will retry on next run"
     except Exception as e:
         error_msg = str(e)
         _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
@@ -1027,35 +1289,21 @@ def process_publication(pub):
         cleanup_temp_files(tmp_files)
 
     if ig_code and not dev_mode:
+        clean_permalink = permalink.split('?')[0].split('#')[0] if permalink else None
         update_data = {
             "status": "published",
             "published_at": datetime.now().isoformat(),
-            "instagram_media_id": media_pk or ig_code,
-            "instagram_permalink": permalink,
+            "media_id": media_pk or ig_code,
+            "permalink": clean_permalink,
         }
-        api_patch(f"publications/{pub_id}", update_data)
+        api_patch(f"publication-details/{detail_id}", update_data)
         for inv_id in inv_ids:
             api_patch(f"inventory/{inv_id}", {"posted_instagram": "1"})
-            if permalink:
-                api_post("inventory-urls", {"inventory_id": inv_id, "url": permalink})
-        _logger and _logger.log(f"  [OK] Publication #{pub_id} completed: {permalink}")
+            if clean_permalink:
+                api_post("inventory-urls", {"inventory_id": inv_id, "url": clean_permalink})
+        _logger and _logger.log(f"  [OK] Publication #{pub_id} (detail #{detail_id}) completed: {clean_permalink}")
 
         if story_failed:
-            if inv_for_meta:
-                owner_id = inv_for_meta.get("user_id")
-                if owner_id and story_video_path:
-                    token = _get_token()
-                    if token:
-                        try:
-                            url = f"{API_BASE.rstrip('/')}/auth/user/{owner_id}"
-                            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-                            with urllib.request.urlopen(req, timeout=10) as resp:
-                                owner = json.loads(resp.read().decode("utf-8"))
-                            if owner and owner.get("telegram_id"):
-                                send_telegram_video(owner["telegram_id"], story_video_path,
-                                                    f"Story fallida para #{pub_id}: {product_name}")
-                        except Exception:
-                            pass
             _logger and _logger.log("  [WARN] Story no se subio. Publicacion en IG correcta pero sin story.")
 
         notify_msg = f"Publicacion #{pub_id} completada!\nProducto: {product_name}\n{permalink}"
@@ -1067,11 +1315,11 @@ def process_publication(pub):
         _logger and _logger.log(f"  [DEV] Publicacion #{pub_id} guardada en modo developer")
     else:
         if not dev_mode:
-            api_patch(f"publications/{pub_id}", {
+            api_patch(f"publication-details/{detail_id}", {
                 "status": "failed",
                 "error_message": error_msg or "Unknown error",
             })
-        _logger and _logger.log(f"  [FAIL] Publication #{pub_id} failed: {error_msg}")
+        _logger and _logger.log(f"  [FAIL] Publication #{pub_id} (detail #{detail_id}) failed: {error_msg}")
 
         notify_msg = f"Publicacion #{pub_id} ERROR!\nProducto: {product_name}\nError: {error_msg}"
         if inv_for_meta:
@@ -1086,9 +1334,9 @@ def process_publication(pub):
 
 
 def main():
-    global _IG_CLIENT, _logger, _SETTINGS_CACHE, _SESSION_FILE
+    global _logger, _SETTINGS_CACHE
 
-    parser = argparse.ArgumentParser(description="CardVault Instagram Publisher (instagrapi)")
+    parser = argparse.ArgumentParser(description="CardVault Instagram Publisher (Graph API)")
     parser.add_argument("--publication-id", type=int, default=None, help="Publish a specific publication by ID")
     parser.add_argument("--dry-run", action="store_true", help="Show pending without publishing")
     args = parser.parse_args()
@@ -1115,40 +1363,42 @@ def main():
     _logger.log(f"[OK] Authenticated  [{BUILD_VERSION}]")
     _logger.log(f"Settings loaded: {len(settings_list)} total, {len(settings_by_key)} by key")
 
-    custom_session = settings_by_key.get("instagram.session.path")
-    if custom_session:
-        _SESSION_FILE = custom_session
-    _logger.log(f"IG Session file: {_SESSION_FILE}")
-
-    ig_username = (settings_by_key.get("instagram.username") or
-                   get_setting("instagram.username"))
-    ig_password = (settings_by_key.get("instagram.password") or
-                   get_setting("instagram.password"))
-
     dev_mode = (_DEV_MODE or
-                (settings_by_key.get("instagram.dev.mode") or get_setting("instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
+                (settings_by_key.get("task.publisher.instagram.dev.mode") or get_setting("task.publisher.instagram.dev.mode") or "").strip() in ("1", "true", "yes"))
 
+    r2 = None
     if not dev_mode:
-        if not ig_username or not ig_password:
-            _logger.log("[FAIL] No Instagram credentials.")
-            _logger.log("  Set settings 'instagram.username' and 'instagram.password' in CardVault")
+        ig_cfg = get_ig_config()
+        if not all([ig_cfg["access_token"], ig_cfg["user_id"]]):
+            _logger.log("[FAIL] No Instagram Graph API credentials.")
+            _logger.log("  Set settings 'instagram.access_token' and 'instagram.user_id' in CardVault")
             finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
             sys.exit(1)
 
-        _logger.log(f"IG User: {ig_username}")
+        _logger.log(f"IG User ID: {ig_cfg['user_id']}")
+
+        r2 = create_r2_client()
+        if not r2:
+            _logger.log("[FAIL] R2 not configured. Set r2.* settings in CardVault")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            sys.exit(1)
+        _logger.log("[OK] R2 initialized")
+
+        try_refresh_token(ig_cfg)
+        _SETTINGS_CACHE = None
     else:
-        dev_output = (settings_by_key.get("instagram.dev.output") or
-                      get_setting("instagram.dev.output") or
+        dev_output = (settings_by_key.get("task.publisher.instagram.dev.output") or
+                      get_setting("task.publisher.instagram.dev.output") or
                       os.path.join(_SCRIPT_DIR, "dev_output"))
         dev_output = os.path.abspath(dev_output)
         _logger.log("[DEV] Modo developer activo — no se publica en Instagram")
         _logger.log(f"[DEV] Salida local: {dev_output}")
 
-    music_dir = settings_by_key.get("instagram.music.dir")
+    music_dir = settings_by_key.get("task.publisher.instagram.music.dir")
     if music_dir:
         _logger.log(f"[OK] IG Music dir: {music_dir}")
     else:
-        _logger.log("[INFO] No 'instagram.music.dir' configured.")
+        _logger.log("[INFO] No 'task.publisher.instagram.music.dir' configured.")
 
     if args.publication_id:
         pub = api_get(f"publications/{args.publication_id}")
@@ -1156,35 +1406,44 @@ def main():
             _logger.log(f"[FAIL] Publication #{args.publication_id} not found")
             finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
             sys.exit(1)
-        process_publication(pub)
+        details = api_get(f"publication-details/by-publication/{args.publication_id}") or []
+        ig_details = [d for d in details if d.get("platform") == "instagram"]
+        if not ig_details:
+            _logger.log(f"[FAIL] No Instagram detail for publication #{args.publication_id}")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            sys.exit(1)
+        for detail in ig_details:
+            process_detail(detail, r2)
     else:
-        pending = api_get("publications/pending-publish") or []
-        _logger.log(f"Found {len(pending)} pending publication(s)")
+        pending = api_get("publication-details/pending?platform=instagram") or []
+        _logger.log(f"Found {len(pending)} pending Instagram detail(s)")
 
         if not pending:
-            _logger.log("[DONE] No pending publications")
+            _logger.log("[DONE] No pending Instagram details")
             finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
             return
 
         if args.dry_run:
-            for p in pending:
-                inv = api_get(f"inventory/{p['inventory_id']}")
-                product = (inv or {}).get("product", {})
-                name = product.get("name") or product.get("product_number", "?")
-                _logger.log(f"  #{p['id']} | inv #{p['inventory_id']} | {name} | scheduled: {p.get('scheduled_at')}")
+            for d in pending:
+                pub_id = d.get("publication_id")
+                _logger.log(f"  Detail #{d['id']} | pub #{pub_id} | scheduled: {d.get('scheduled_at')}")
             finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
             return
 
-        for pub in pending:
-            if not dev_mode:
-                cl = get_ig_client()
-                if not cl:
-                    _logger.log("[FAIL] IG session lost mid-run, aborting remaining")
-                    break
-            process_publication(pub)
+        for detail in pending:
+            process_detail(detail, r2)
 
     _logger.log("[DONE] Instagram publisher finished")
     finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+
+
+def publish(details, context):
+    global _logger, _SETTINGS_CACHE
+    _logger = context.get("logger")
+    _SETTINGS_CACHE = context.get("settings_cache")
+    r2 = context.get("r2")
+    for detail in details:
+        process_detail(detail, r2)
 
 
 if __name__ == "__main__":

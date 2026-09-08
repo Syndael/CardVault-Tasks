@@ -1,5 +1,0 @@
-Publication ID: 20
-Product: 93
-Collection: Edición Básica
-Inventories: [39, 67]
-Total files: 4
