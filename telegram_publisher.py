@@ -326,14 +326,14 @@ def process_detail(detail, context=None):
     if collection_name:
         _logger and _logger.log(f"  Collection: {collection_name}")
     _logger and _logger.log(f"  Files: {len(all_file_ids)} file(s)")
-    
-    is_broadcast = detail.get("is_broadcast", False)
-    if is_broadcast:
-        _logger and _logger.log(f"  Mode: broadcast (text only)")
-    else:
-        _logger and _logger.log(f"  Mode: content (with images)")
 
-    if not all_file_ids and not is_broadcast:
+    has_files = bool(all_file_ids)
+    if has_files:
+        _logger and _logger.log(f"  Mode: content (with images)")
+    else:
+        _logger and _logger.log(f"  Mode: text only (no files assigned)")
+
+    if not has_files:
         error_msg = "No images for this publication"
         _logger and _logger.log(f"  [FAIL] {error_msg}")
         api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
@@ -351,34 +351,24 @@ def process_detail(detail, context=None):
     message_id = None
     error_msg = None
 
-    if is_broadcast:
-        _logger and _logger.log(f"  Sending text message...")
-        try:
-            message_id, error = send_telegram_message(chat_id, caption)
-            if not message_id:
-                error_msg = error or "Error enviando mensaje a Telegram"
-        except Exception as e:
-            error_msg = str(e)
-            _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
-    else:
-        _logger and _logger.log(f"  Downloading first image...")
-        tmp_file = download_first_image_to_temp(all_file_ids)
+    _logger and _logger.log(f"  Downloading first image...")
+    tmp_file = download_first_image_to_temp(all_file_ids)
 
-        if not tmp_file:
-            error_msg = "Could not download image from API"
-            _logger and _logger.log(f"  [FAIL] {error_msg}")
-            api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
-            return
+    if not tmp_file:
+        error_msg = "Could not download image from API"
+        _logger and _logger.log(f"  [FAIL] {error_msg}")
+        api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
+        return
 
-        try:
-            message_id, error = send_telegram_photo(chat_id, tmp_file, caption)
-            if not message_id:
-                error_msg = error or "Error enviando foto a Telegram"
-        except Exception as e:
-            error_msg = str(e)
-            _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
-        finally:
-            cleanup_temp_file(tmp_file)
+    try:
+        message_id, error = send_telegram_photo(chat_id, tmp_file, caption)
+        if not message_id:
+            error_msg = error or "Error enviando foto a Telegram"
+    except Exception as e:
+        error_msg = str(e)
+        _logger and _logger.log(f"  [EXCEPTION] {error_msg}")
+    finally:
+        cleanup_temp_file(tmp_file)
 
     if message_id:
         bot_token = get_setting("task.publisher.telegram.token") or ""

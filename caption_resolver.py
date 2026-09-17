@@ -21,6 +21,46 @@ TAG_MAP = {
 }
 
 
+def _build_default_title_from_inventories(publication):
+    inventories = publication.get("inventories") or []
+    if not inventories:
+        return None
+
+    inv = inventories[0]
+    product = inv.get("product") or {}
+    collection = inv.get("collection") or {}
+
+    collection_code = collection.get("code") or ""
+    product_number = product.get("product_number") or ""
+
+    translations = product.get("translations") or []
+    sorted_translations = sorted(
+        translations,
+        key=lambda t: (t.get("language") or {}).get("priority_order", 999) or 999
+    )
+    primary_name = sorted_translations[0].get("name") if sorted_translations else None
+
+    jp_name = None
+    for t in sorted_translations:
+        lang = t.get("language") or {}
+        if lang.get("abbreviation") == "JP" or lang.get("name", "").lower() == "japanese":
+            jp_name = t.get("name")
+            break
+
+    prefix_parts = []
+    if collection_code:
+        prefix_parts.append(collection_code)
+    if product_number:
+        prefix_parts.append(product_number)
+    prefix = f"({' - '.join(prefix_parts)})" if prefix_parts else ""
+
+    name_part = primary_name or ""
+    jp_part = f" ({jp_name})" if jp_name else ""
+
+    title = f"{prefix} {name_part}{jp_part}".strip()
+    return title if title else None
+
+
 def resolve_caption_tags(caption, publication):
     if not caption:
         return caption, []
@@ -36,6 +76,8 @@ def resolve_caption_tags(caption, publication):
 
         if kind == "title":
             value = (publication.get("title") or "").strip()
+            if not value:
+                value = _build_default_title_from_inventories(publication)
             if not value:
                 unresolved.append(tag)
                 return match.group(0)

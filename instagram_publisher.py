@@ -315,6 +315,21 @@ class InstagramGraphAPI:
                 _logger and _logger.log(f"  [ERROR] Error verificando token IG: {error_msg}")
             return False
 
+    def get_token_expires_in(self):
+        try:
+            result = self._make_request("debug_token", params={"input_token": self.access_token}, method="GET")
+            data = result.get("data", {})
+            expires_at = data.get("expires_at", 0)
+            if expires_at == 0:
+                return -1
+            import time
+            now = int(time.time())
+            remaining = expires_at - now
+            return max(0, remaining)
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] No se pudo obtener expiracion del token: {e}")
+            return -1
+
     def _make_request(self, endpoint, params=None, method="POST"):
         url = f"{self.GRAPH_URL}/{endpoint}"
         if params is None:
@@ -503,7 +518,7 @@ class InstagramGraphAPI:
 
 def refresh_ig_token(access_token, app_id, app_secret):
     try:
-        url = "https://graph.instagram.com/refresh_access_token"
+        url = f"{InstagramGraphAPI.GRAPH_URL}/refresh_access_token"
         params = {
             "grant_type": "ig_refresh_token",
             "access_token": access_token,
@@ -528,11 +543,19 @@ def try_refresh_token(cfg_data):
     _logger and _logger.log("Verificando token de Instagram...")
     ig = InstagramGraphAPI(cfg_data["access_token"], cfg_data["user_id"])
 
-    if ig.verify_token():
-        _logger and _logger.log("  Token valido, no es necesario refrescar")
-        return True
+    if not ig.verify_token():
+        _logger and _logger.log("  [WARN] Token invalido o expirado, intentando refrescar...")
+    else:
+        expires_in = ig.get_token_expires_in()
+        if expires_in < 0:
+            _logger and _logger.log("  Token valido (no se pudo determinar expiracion)")
+            return True
+        days_left = expires_in // 86400
+        if days_left >= 7:
+            _logger and _logger.log(f"  Token valido, {days_left} dias restantes. No es necesario refrescar")
+            return True
+        _logger and _logger.log(f"  [WARN] Token expira en {days_left} dias, refrescando...")
 
-    _logger and _logger.log("  [WARN] Token invalido o expirado, intentando refrescar...")
     new_token, expires_in = refresh_ig_token(
         cfg_data["access_token"], cfg_data["app_id"], cfg_data["app_secret"]
     )
@@ -1384,8 +1407,12 @@ def main():
             sys.exit(1)
         _logger.log("[OK] R2 initialized")
 
-        try_refresh_token(ig_cfg)
-        _SETTINGS_CACHE = None
+        if not try_refresh_token(ig_cfg):
+            _logger.log("[FAIL] No se pudo refrescar el token de Instagram. Token expirado o invalido.")
+            finalize_log(_logger, "instagram_publisher", _API_ROOT, api_request)
+            sys.exit(1)
+        if _SETTINGS_CACHE is not None:
+            _SETTINGS_CACHE["task.publisher.instagram.access.token"] = ig_cfg["access_token"]
     else:
         dev_output = (settings_by_key.get("task.publisher.instagram.dev.output") or
                       get_setting("task.publisher.instagram.dev.output") or
