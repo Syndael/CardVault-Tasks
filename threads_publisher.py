@@ -56,7 +56,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.3"
+BUILD_VERSION = "v1.4"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -173,6 +173,29 @@ def get_threads_config():
     }
 
 
+def refresh_threads_token(app_secret, current_token):
+    try:
+        resp = requests.post(
+            "https://graph.threads.net/access_token",
+            data={
+                "grant_type": "th_exchange_token",
+                "client_secret": app_secret,
+                "access_token": current_token,
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_token = data.get("access_token")
+        if new_token:
+            api_patch("settings/by-key/task.publisher.threads.access.token/", {"setting_value": new_token})
+            _logger and _logger.log(f"  [OK] Token de Threads refrescado")
+            return new_token
+    except Exception as e:
+        _logger and _logger.log(f"  [WARN] No se pudo refrescar token: {e}")
+    return None
+
+
 def download_images_to_temp(file_ids):
     tmp_files = []
     for fid in file_ids:
@@ -281,9 +304,10 @@ def create_r2_client():
 class ThreadsGraphAPI:
     GRAPH_URL = "https://graph.threads.net/v1.0"
 
-    def __init__(self, access_token, user_id):
+    def __init__(self, access_token, user_id, app_secret=None):
         self.access_token = access_token
         self.user_id = user_id
+        self.app_secret = app_secret
         self.max_retries = 3
 
     def _make_request(self, endpoint, params=None, method="POST"):
@@ -300,6 +324,22 @@ class ThreadsGraphAPI:
                     r = requests.get(url, params=params, timeout=60)
                 r.raise_for_status()
                 return r.json()
+            except requests.exceptions.HTTPError as e:
+                if r.status_code == 400 and self.app_secret:
+                    error_data = r.json() if r else {}
+                    error_msg = error_data.get("error", {}).get("message", "")
+                    if "expired" in error_msg.lower() or "session" in error_msg.lower():
+                        _logger and _logger.log(f"  [INFO] Token expirado, intentando refrescar...")
+                        new_token = refresh_threads_token(self.app_secret, self.access_token)
+                        if new_token:
+                            self.access_token = new_token
+                            params["access_token"] = new_token
+                            continue
+                _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2)
+                else:
+                    raise
             except requests.exceptions.RequestException as e:
                 _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
@@ -535,7 +575,7 @@ def process_detail(detail, context=None):
         api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
         return
 
-    threads = ThreadsGraphAPI(threads_cfg["access_token"], threads_cfg["user_id"])
+    threads = ThreadsGraphAPI(threads_cfg["access_token"], threads_cfg["user_id"], threads_cfg["app_secret"])
 
     _logger and _logger.log(f"  Downloading {len(all_file_ids)} file(s)...")
     tmp_files = download_images_to_temp(all_file_ids[:10])
