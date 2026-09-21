@@ -56,7 +56,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.4"
+BUILD_VERSION = "v1.5"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -261,7 +261,18 @@ class R2Storage:
                     Body=f.read(),
                     ContentType=content_type,
                 )
-            public_url = f"{self.public_url}/{key}"
+            
+            # Generar URL firmada válida por 1 hora
+            try:
+                public_url = self.client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': self.bucket_name, 'Key': key},
+                    ExpiresIn=3600  # 1 hora
+                )
+            except Exception:
+                # Fallback a URL pública si no se puede firmar
+                public_url = f"{self.public_url}/{key}"
+            
             _logger and _logger.log(f"  Imagen subida a R2: {key}")
             return public_url, key
         except Exception as e:
@@ -335,6 +346,8 @@ class ThreadsGraphAPI:
                             self.access_token = new_token
                             params["access_token"] = new_token
                             continue
+                    else:
+                        _logger and _logger.log(f"  [ERROR] Threads API error: {error_msg}")
                 _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2)
