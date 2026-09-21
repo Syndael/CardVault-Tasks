@@ -69,7 +69,7 @@ from task_logger import TaskLogger, finalize_log
 
 load_dotenv()
 
-BUILD_VERSION = "v5.1-graph-api"
+BUILD_VERSION = "v5.2-graph-api"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -205,6 +205,31 @@ def update_setting(key, value):
     return api_patch(f"settings/by-key/{key}", {"setting_value": value}) is not None
 
 
+def refresh_instagram_token(app_id, app_secret, current_token):
+    """Renueva el token de Instagram Graph API."""
+    try:
+        resp = requests.get(
+            "https://graph.facebook.com/v21.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": app_id,
+                "client_secret": app_secret,
+                "fb_exchange_token": current_token,
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_token = data.get("access_token")
+        if new_token:
+            update_setting("task.publisher.instagram.access.token", new_token)
+            _logger and _logger.log(f"  [OK] Token de Instagram refrescado")
+            return new_token
+    except Exception as e:
+        _logger and _logger.log(f"  [WARN] No se pudo refrescar token de Instagram: {e}")
+    return None
+
+
 def download_images_to_temp(file_ids):
     tmp_files = []
     for fid in file_ids:
@@ -291,12 +316,17 @@ class R2Storage:
 
 class InstagramGraphAPI:
     GRAPH_URL = "https://graph.facebook.com/v21.0"
+    TOKEN_REFRESH_MARGIN_DAYS = 7  # Renueva el token 7 días antes de que expire
 
-    def __init__(self, access_token, ig_user_id):
+    def __init__(self, access_token, ig_user_id, app_id=None, app_secret=None):
         self.access_token = access_token
         self.ig_user_id = ig_user_id
+        self.app_id = app_id
+        self.app_secret = app_secret
         self.max_retries = 3
         self._token_valid = None
+        self.token_expires_at = None
+        self._check_token_expiration()
 
     def verify_token(self):
         if self._token_valid is not None:
@@ -330,6 +360,43 @@ class InstagramGraphAPI:
             _logger and _logger.log(f"  [WARN] No se pudo obtener expiracion del token: {e}")
             return -1
 
+    def _check_token_expiration(self):
+        """Verifica si el token necesita renovarse (margen de 1 semana)."""
+        if not (self.app_id and self.app_secret):
+            return
+        
+        try:
+            # Consultar información del token
+            resp = requests.get(
+                f"{self.GRAPH_URL}/debug_token",
+                params={
+                    "input_token": self.access_token,
+                    "access_token": f"{self.app_id}|{self.app_secret}"
+                },
+                timeout=30
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                expires_at = data.get("data", {}).get("expires_at")
+                
+                if expires_at:
+                    from datetime import datetime, timezone
+                    self.token_expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+                    
+                    # Calcular si quedan menos de 7 días
+                    now = datetime.now(timezone.utc)
+                    days_remaining = (self.token_expires_at - now).total_seconds() / 86400
+                    
+                    if days_remaining < self.TOKEN_REFRESH_MARGIN_DAYS:
+                        _logger and _logger.log(f"  [INFO] Token IG expira en {days_remaining:.1f} días, renovando...")
+                        new_token = refresh_instagram_token(self.app_id, self.app_secret, self.access_token)
+                        if new_token:
+                            self.access_token = new_token
+                            _logger and _logger.log(f"  [OK] Token IG renovado proactivamente")
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] No se pudo verificar expiración del token IG: {e}")
+
     def _make_request(self, endpoint, params=None, method="POST"):
         url = f"{self.GRAPH_URL}/{endpoint}"
         if params is None:
@@ -344,6 +411,38 @@ class InstagramGraphAPI:
                     r = requests.get(url, params=params, timeout=60)
                 r.raise_for_status()
                 return r.json()
+            except requests.exceptions.HTTPError as e:
+                if r.status_code == 400:
+                    try:
+                        error_data = r.json()
+                        error_msg = error_data.get("error", {}).get("message", "")
+                        error_type = error_data.get("error", {}).get("type", "")
+                        error_subcode = error_data.get("error", {}).get("error_subcode", "")
+                        
+                        if error_msg:
+                            _logger and _logger.log(f"  [ERROR] Instagram API error: {error_msg}")
+                            if error_type:
+                                _logger and _logger.log(f"  [ERROR] Type: {error_type}")
+                            if error_subcode:
+                                _logger and _logger.log(f"  [ERROR] Subcode: {error_subcode}")
+                        else:
+                            _logger and _logger.log(f"  [ERROR] Response body: {r.text[:500]}")
+                        
+                        if (self.app_id and self.app_secret) and ("expired" in error_msg.lower() or "session" in error_msg.lower() or "invalid" in error_msg.lower()):
+                            _logger and _logger.log(f"  [INFO] Token IG expirado, intentando refrescar...")
+                            new_token = refresh_instagram_token(self.app_id, self.app_secret, self.access_token)
+                            if new_token:
+                                self.access_token = new_token
+                                params["access_token"] = new_token
+                                continue
+                    except Exception as parse_err:
+                        _logger and _logger.log(f"  [ERROR] Could not parse error response: {r.text[:500]}")
+                
+                _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2)
+                else:
+                    raise
             except requests.exceptions.RequestException as e:
                 _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
@@ -541,7 +640,7 @@ def refresh_ig_token(access_token, app_id, app_secret):
 
 def try_refresh_token(cfg_data):
     _logger and _logger.log("Verificando token de Instagram...")
-    ig = InstagramGraphAPI(cfg_data["access_token"], cfg_data["user_id"])
+    ig = InstagramGraphAPI(cfg_data["access_token"], cfg_data["user_id"], cfg_data.get("app_id"), cfg_data.get("app_secret"))
 
     if not ig.verify_token():
         _logger and _logger.log("  [WARN] Token invalido o expirado, intentando refrescar...")
@@ -610,7 +709,7 @@ def publish_instagram(r2, image_paths, caption):
     if not all([ig_cfg["access_token"], ig_cfg["user_id"]]):
         return None, None, None, "Credenciales IG incompletas. Configure instagram.access_token e instagram.user_id"
 
-    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"])
+    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"], ig_cfg.get("app_id"), ig_cfg.get("app_secret"))
     if not ig.verify_token():
         return None, None, None, "Token de Instagram expirado o invalido. Regenera el token en Facebook Developers."
 
@@ -654,7 +753,7 @@ def share_to_story(r2, image_path, collection_name, video_path=None, frame_path=
             return False, video_path
         return False, None
 
-    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"])
+    ig = InstagramGraphAPI(ig_cfg["access_token"], ig_cfg["user_id"], ig_cfg.get("app_id"), ig_cfg.get("app_secret"))
     if not ig.verify_token():
         _logger and _logger.log("  [ERROR] Token IG expirado, no se puede publicar story")
         if video_path:

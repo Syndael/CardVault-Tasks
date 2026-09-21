@@ -56,7 +56,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.5"
+BUILD_VERSION = "v1.8"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -263,15 +263,11 @@ class R2Storage:
                 )
             
             # Generar URL firmada válida por 1 hora
-            try:
-                public_url = self.client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': self.bucket_name, 'Key': key},
-                    ExpiresIn=3600  # 1 hora
-                )
-            except Exception:
-                # Fallback a URL pública si no se puede firmar
-                public_url = f"{self.public_url}/{key}"
+            public_url = self.client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': key},
+                ExpiresIn=3600  # 1 hora
+            )
             
             _logger and _logger.log(f"  Imagen subida a R2: {key}")
             return public_url, key
@@ -312,14 +308,122 @@ def create_r2_client():
         return None
 
 
+def download_file_to_temp(file_id):
+    """Descarga un archivo desde la API y lo guarda temporalmente."""
+    url = f"{API_BASE.rstrip('/')}/files/{file_id}/content"
+    token = _get_token()
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        
+        ext = ".jpg"
+        content_type = resp.headers.get("Content-Type", "")
+        if "png" in content_type:
+            ext = ".png"
+        elif "gif" in content_type:
+            ext = ".gif"
+        elif "webp" in content_type:
+            ext = ".webp"
+        
+        tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        tmp.write(data)
+        tmp.close()
+        return tmp.name
+    except Exception as e:
+        _logger and _logger.log(f"  [WARN] Fallo al descargar fichero {file_id}: {e}")
+        return None
+
+
+def cleanup_temp_file(tmp_file):
+    """Elimina un archivo temporal."""
+    try:
+        os.unlink(tmp_file)
+    except Exception:
+        pass
+
+
+def upload_to_r2_or_api(file_ids):
+    """
+    Intenta subir a R2, si falla usa el endpoint público de la API.
+    Retorna lista de URLs públicas y lista de keys para limpieza.
+    """
+    r2 = create_r2_client()
+    
+    if not r2:
+        # Fallback: usar endpoint público de la API
+        _logger and _logger.log("  [INFO] R2 no disponible, usando API pública")
+        return [f"{API_BASE.rstrip('/')}/files/{fid}/public" for fid in file_ids], []
+    
+    urls = []
+    keys = []
+    
+    for fid in file_ids:
+        # Descargar archivo temporal
+        tmp_file = download_file_to_temp(fid)
+        if not tmp_file:
+            continue
+        
+        # Subir a R2
+        url, key = r2.upload_image(tmp_file)
+        if url:
+            urls.append(url)
+            keys.append(key)
+        
+        # Limpiar archivo temporal
+        cleanup_temp_file(tmp_file)
+    
+    return urls, keys
+
+
 class ThreadsGraphAPI:
     GRAPH_URL = "https://graph.threads.net/v1.0"
+    TOKEN_REFRESH_MARGIN_DAYS = 7  # Renueva el token 7 días antes de que expire
 
     def __init__(self, access_token, user_id, app_secret=None):
         self.access_token = access_token
         self.user_id = user_id
         self.app_secret = app_secret
         self.max_retries = 3
+        self.token_expires_at = None
+        self._check_token_expiration()
+
+    def _check_token_expiration(self):
+        """Verifica si el token necesita renovarse (margen de 1 semana)."""
+        if not self.app_secret:
+            return
+        
+        try:
+            # Consultar información del token
+            resp = requests.get(
+                f"{self.GRAPH_URL}/debug_token",
+                params={
+                    "input_token": self.access_token,
+                    "access_token": f"{self.app_secret}|{self.app_secret}"
+                },
+                timeout=30
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                expires_at = data.get("data", {}).get("expires_at")
+                
+                if expires_at:
+                    from datetime import datetime, timezone
+                    self.token_expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc)
+                    
+                    # Calcular si quedan menos de 7 días
+                    now = datetime.now(timezone.utc)
+                    days_remaining = (self.token_expires_at - now).total_seconds() / 86400
+                    
+                    if days_remaining < self.TOKEN_REFRESH_MARGIN_DAYS:
+                        _logger and _logger.log(f"  [INFO] Token expira en {days_remaining:.1f} días, renovando...")
+                        new_token = refresh_threads_token(self.app_secret, self.access_token)
+                        if new_token:
+                            self.access_token = new_token
+                            _logger and _logger.log(f"  [OK] Token renovado proactivamente")
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] No se pudo verificar expiración del token: {e}")
 
     def _make_request(self, endpoint, params=None, method="POST"):
         url = f"{self.GRAPH_URL}/{endpoint}"
@@ -336,18 +440,32 @@ class ThreadsGraphAPI:
                 r.raise_for_status()
                 return r.json()
             except requests.exceptions.HTTPError as e:
-                if r.status_code == 400 and self.app_secret:
-                    error_data = r.json() if r else {}
-                    error_msg = error_data.get("error", {}).get("message", "")
-                    if "expired" in error_msg.lower() or "session" in error_msg.lower():
-                        _logger and _logger.log(f"  [INFO] Token expirado, intentando refrescar...")
-                        new_token = refresh_threads_token(self.app_secret, self.access_token)
-                        if new_token:
-                            self.access_token = new_token
-                            params["access_token"] = new_token
-                            continue
-                    else:
-                        _logger and _logger.log(f"  [ERROR] Threads API error: {error_msg}")
+                if r.status_code == 400:
+                    try:
+                        error_data = r.json()
+                        error_msg = error_data.get("error", {}).get("message", "")
+                        error_type = error_data.get("error", {}).get("type", "")
+                        error_subcode = error_data.get("error", {}).get("error_subcode", "")
+                        
+                        if error_msg:
+                            _logger and _logger.log(f"  [ERROR] Threads API error: {error_msg}")
+                            if error_type:
+                                _logger and _logger.log(f"  [ERROR] Type: {error_type}")
+                            if error_subcode:
+                                _logger and _logger.log(f"  [ERROR] Subcode: {error_subcode}")
+                        else:
+                            _logger and _logger.log(f"  [ERROR] Response body: {r.text[:500]}")
+                        
+                        if self.app_secret and ("expired" in error_msg.lower() or "session" in error_msg.lower()):
+                            _logger and _logger.log(f"  [INFO] Token expirado, intentando refrescar...")
+                            new_token = refresh_threads_token(self.app_secret, self.access_token)
+                            if new_token:
+                                self.access_token = new_token
+                                params["access_token"] = new_token
+                                continue
+                    except Exception as parse_err:
+                        _logger and _logger.log(f"  [ERROR] Could not parse error response: {r.text[:500]}")
+                
                 _logger and _logger.log(f"  Request fallo (intento {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2)
