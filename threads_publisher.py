@@ -56,7 +56,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.1"
+BUILD_VERSION = "v1.2"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
