@@ -313,14 +313,14 @@ class ThreadsGraphAPI:
             try:
                 result = self._make_request(
                     container_id,
-                    params={"fields": "status,status_code"},
+                    params={"fields": "status"},
                     method="GET",
                 )
-                status = result.get("status_code", "")
+                status = result.get("status", "")
                 if status == "FINISHED":
                     return True
                 elif status == "ERROR":
-                    _logger and _logger.log(f"  Container error: {result.get('status', 'unknown')}")
+                    _logger and _logger.log(f"  Container error: {result.get('error_message', 'unknown')}")
                     return False
                 time.sleep(2)
             except Exception as e:

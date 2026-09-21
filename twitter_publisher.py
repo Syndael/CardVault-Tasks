@@ -277,6 +277,7 @@ def process_detail(detail, context=None):
     pub = detail.get("publication") or api_get(f"publications/{pub_id}") or {}
     caption = detail.get("resolved_caption") or detail.get("caption") or pub.get("caption") or ""
     existing_status = detail.get("status", "pending_publish")
+    is_broadcast = detail.get("is_broadcast", False)
 
     if existing_status in ("published", "cancelled"):
         _logger and _logger.log(f"  [SKIP] Detail #{detail_id} already {existing_status}")
@@ -334,8 +335,10 @@ def process_detail(detail, context=None):
     if collection_name:
         _logger and _logger.log(f"  Collection: {collection_name}")
     _logger and _logger.log(f"  Files: {len(all_file_ids)} file(s)")
+    if is_broadcast:
+        _logger and _logger.log(f"  Mode: broadcast (text-only allowed)")
 
-    if not all_file_ids:
+    if not all_file_ids and not is_broadcast:
         error_msg = "No images for this publication"
         _logger and _logger.log(f"  [FAIL] {error_msg}")
         api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
@@ -343,14 +346,16 @@ def process_detail(detail, context=None):
 
     api_patch(f"publication-details/{detail_id}", {"status": "processing"})
 
-    _logger and _logger.log(f"  Downloading {len(all_file_ids)} file(s)...")
-    tmp_files = download_images_to_temp(all_file_ids)
+    tmp_files = []
+    if all_file_ids:
+        _logger and _logger.log(f"  Downloading {len(all_file_ids)} file(s)...")
+        tmp_files = download_images_to_temp(all_file_ids)
 
-    if not tmp_files:
-        error_msg = "Could not download any images from API"
-        _logger and _logger.log(f"  [FAIL] {error_msg}")
-        api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
-        return
+        if not tmp_files:
+            error_msg = "Could not download any images from API"
+            _logger and _logger.log(f"  [FAIL] {error_msg}")
+            api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
+            return
 
     twitter_cfg = get_twitter_config()
     if not all([twitter_cfg["api_key"], twitter_cfg["api_secret"], twitter_cfg["access_token"], twitter_cfg["access_secret"]]):
@@ -372,10 +377,10 @@ def process_detail(detail, context=None):
             if media_id:
                 media_ids.append(media_id)
 
-        if not media_ids:
+        if tmp_files and not media_ids:
             error_msg = "No se pudieron subir imagenes a Twitter"
         else:
-            tweet_id, error = twitter.create_tweet(caption, media_ids)
+            tweet_id, error = twitter.create_tweet(caption, media_ids if media_ids else None)
             if not tweet_id:
                 error_msg = error or "Error creando tweet"
     except Exception as e:
