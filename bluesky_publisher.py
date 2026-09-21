@@ -45,7 +45,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.1"
+BUILD_VERSION = "v1.2"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -205,6 +205,7 @@ class BlueSkyAPI:
         self.password = password
         self.access_token = None
         self.did = None
+        self.handle = None
         self._authenticate()
 
     def _authenticate(self):
@@ -221,7 +222,8 @@ class BlueSkyAPI:
             data = resp.json()
             self.access_token = data.get("accessJwt")
             self.did = data.get("did")
-            _logger and _logger.log(f"  BlueSky authenticated: {self.identifier} ({self.did})")
+            self.handle = data.get("handle")
+            _logger and _logger.log(f"  BlueSky authenticated: {self.handle} ({self.did})")
         except Exception as e:
             _logger and _logger.log(f"  [ERROR] BlueSky auth failed: {e}")
             raise
@@ -426,7 +428,7 @@ def process_detail(detail, context=None):
         cleanup_temp_files(tmp_files)
 
     if uri:
-        handle = bluesky_cfg["identifier"]
+        handle = bluesky.handle or bluesky_cfg["identifier"]
         rkey = uri.split("/")[-1]
         permalink = f"https://bsky.app/profile/{handle}/post/{rkey}"
         clean_permalink = permalink.split('?')[0].split('#')[0]

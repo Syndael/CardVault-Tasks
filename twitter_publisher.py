@@ -49,7 +49,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.2"
+BUILD_VERSION = "v1.3"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -209,7 +209,7 @@ class TwitterAPI:
     TWEET_URL = "https://api.twitter.com/2/tweets"
 
     def __init__(self, api_key, api_secret, access_token, access_secret):
-        self.auth = OAuth1(api_key, api_secret, access_token, access_secret, signature_type='body')
+        self.auth = OAuth1(api_key, api_secret, access_token, access_secret, signature_type='auth_header')
 
     def upload_media(self, image_path):
         try:

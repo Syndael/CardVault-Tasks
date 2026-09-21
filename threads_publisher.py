@@ -56,7 +56,7 @@ from task_notifier import notify_unresolved_tags
 
 load_dotenv()
 
-BUILD_VERSION = "v1.2"
+BUILD_VERSION = "v1.3"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "CardVault-API"))
@@ -169,6 +169,7 @@ def get_threads_config():
         "user_id": get_setting("task.publisher.threads.user.id") or "",
         "app_id": get_setting("task.publisher.threads.app.id") or "",
         "app_secret": get_setting("task.publisher.threads.app.secret") or "",
+        "username": get_setting("task.publisher.threads.username") or "",
     }
 
 
@@ -328,6 +329,13 @@ class ThreadsGraphAPI:
                 time.sleep(2)
         _logger and _logger.log(f"  [ERROR] Timeout esperando container {container_id}")
         return False
+
+    def get_user_info(self):
+        return self._make_request(
+            self.user_id,
+            params={"fields": "id,username"},
+            method="GET",
+        ) or {}
 
     def publish_text(self, text):
         try:
@@ -583,7 +591,14 @@ def process_detail(detail, context=None):
         cleanup_temp_files(tmp_files)
 
     if post_id:
-        permalink = f"https://www.threads.net/@user/post/{post_id}"
+        username = threads_cfg.get("username") or ""
+        if not username:
+            try:
+                user_info = threads.get_user_info()
+                username = user_info.get("username", "user")
+            except Exception:
+                username = "user"
+        permalink = f"https://www.threads.net/@{username}/post/{post_id}"
         clean_permalink = permalink.split('?')[0].split('#')[0]
         update_data = {
             "status": "published",
