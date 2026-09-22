@@ -156,7 +156,96 @@ def get_tiktok_config():
         "client_key": get_setting("task.publisher.tiktok.client.key") or "",
         "client_secret": get_setting("task.publisher.tiktok.client.secret") or "",
         "access_token": get_setting("task.publisher.tiktok.access.token") or "",
+        "refresh_token": get_setting("task.publisher.tiktok.refresh.token") or "",
+        "expires_at": get_setting("task.publisher.tiktok.expires.at") or "",
     }
+
+
+def update_setting(key, value):
+    return api_request("PATCH", f"settings/key/{key}", {"setting_value": value})
+
+
+def refresh_tiktok_token(cfg=None):
+    global _SETTINGS_CACHE
+    if cfg is None:
+        cfg = get_tiktok_config()
+    
+    if not cfg.get("refresh_token"):
+        _logger and _logger.log("  [WARN] No hay refresh_token disponible")
+        return False
+    
+    _logger and _logger.log("  Refrescando token de TikTok...")
+    
+    token_url = "https://open.tiktokapis.com/v2/oauth/token/"
+    
+    data = {
+        "client_key": cfg["client_key"],
+        "client_secret": cfg["client_secret"],
+        "grant_type": "refresh_token",
+        "refresh_token": cfg["refresh_token"],
+    }
+    
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cache-Control": "no-cache",
+    }
+    
+    try:
+        resp = requests.post(token_url, data=data, headers=headers, timeout=30)
+        resp.raise_for_status()
+        token_data = resp.json()
+        
+        if "access_token" not in token_data:
+            _logger and _logger.log(f"  [ERROR] Respuesta inesperada al refrescar: {token_data}")
+            return False
+        
+        access_token = token_data["access_token"]
+        refresh_token = token_data.get("refresh_token", cfg["refresh_token"])
+        expires_in = token_data.get("expires_in", 86400)
+        
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        expires_at_str = expires_at.isoformat()
+        
+        _logger and _logger.log(f"  Token refrescado (expira en {expires_in/3600:.1f}h)")
+        
+        update_setting("task.publisher.tiktok.access.token", access_token)
+        if refresh_token:
+            update_setting("task.publisher.tiktok.refresh.token", refresh_token)
+        update_setting("task.publisher.tiktok.expires.at", expires_at_str)
+        
+        _SETTINGS_CACHE = None
+        return True
+        
+    except Exception as e:
+        _logger and _logger.log(f"  [ERROR] Fallo al refrescar token: {e}")
+        return False
+
+
+def ensure_valid_token():
+    cfg = get_tiktok_config()
+    
+    if not cfg["access_token"]:
+        _logger and _logger.log("  [ERROR] No hay access_token configurado")
+        return None
+    
+    if cfg["expires_at"]:
+        try:
+            expires_dt = datetime.fromisoformat(cfg["expires_at"])
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            remaining = (expires_dt - now).total_seconds()
+            
+            if remaining < 300:
+                _logger and _logger.log(f"  Token expira en {remaining/60:.0f}min, refrescando...")
+                if not refresh_tiktok_token(cfg):
+                    return None
+                cfg = get_tiktok_config()
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] Error parseando expires_at: {e}")
+    
+    return cfg
 
 
 def download_first_image_to_temp(file_ids):
@@ -202,12 +291,49 @@ class TikTokAPI:
     PUBLISH_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
     STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
-    def __init__(self, client_key, client_secret, access_token):
+    def __init__(self, client_key, client_secret, access_token, refresh_token=None, expires_at=None):
         self.client_key = client_key
         self.client_secret = client_secret
         self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.expires_at = expires_at
+
+    def _ensure_valid_token(self):
+        if not self.expires_at:
+            return True
+        
+        try:
+            expires_dt = datetime.fromisoformat(self.expires_at)
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            remaining = (expires_dt - now).total_seconds()
+            
+            if remaining < 300:
+                _logger and _logger.log("  Token expira pronto, refrescando...")
+                cfg = {
+                    "client_key": self.client_key,
+                    "client_secret": self.client_secret,
+                    "refresh_token": self.refresh_token,
+                }
+                if refresh_tiktok_token(cfg):
+                    new_cfg = get_tiktok_config()
+                    self.access_token = new_cfg["access_token"]
+                    self.refresh_token = new_cfg.get("refresh_token")
+                    self.expires_at = new_cfg.get("expires_at")
+                    return True
+                else:
+                    return False
+        except Exception as e:
+            _logger and _logger.log(f"  [WARN] Error verificando token: {e}")
+        
+        return True
 
     def upload_video(self, video_path, caption=""):
+        if not self._ensure_valid_token():
+            _logger and _logger.log("  [ERROR] No se pudo validar/refrescar el token")
+            return None
+        
         try:
             file_size = os.path.getsize(video_path)
             
@@ -372,7 +498,14 @@ def process_detail(detail, context=None):
         api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
         return
 
-    tiktok_cfg = get_tiktok_config()
+    tiktok_cfg = ensure_valid_token()
+    if not tiktok_cfg:
+        error_msg = "No se pudo obtener un token valido de TikTok. Ejecuta tiktok_oauth_helper.py --authorize"
+        _logger and _logger.log(f"  [FAIL] {error_msg}")
+        api_patch(f"publication-details/{detail_id}", {"status": "failed", "error_message": error_msg})
+        cleanup_temp_file(tmp_file)
+        return
+    
     if not all([tiktok_cfg["client_key"], tiktok_cfg["client_secret"], tiktok_cfg["access_token"]]):
         error_msg = "TikTok credentials not configured"
         _logger and _logger.log(f"  [FAIL] {error_msg}")
@@ -380,7 +513,13 @@ def process_detail(detail, context=None):
         cleanup_temp_file(tmp_file)
         return
 
-    tiktok = TikTokAPI(tiktok_cfg["client_key"], tiktok_cfg["client_secret"], tiktok_cfg["access_token"])
+    tiktok = TikTokAPI(
+        tiktok_cfg["client_key"], 
+        tiktok_cfg["client_secret"], 
+        tiktok_cfg["access_token"],
+        tiktok_cfg.get("refresh_token"),
+        tiktok_cfg.get("expires_at")
+    )
 
     publish_id = None
     error_msg = None
